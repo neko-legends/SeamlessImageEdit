@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Seamless Image Edit",
+  "version": "0.1.0",
+  "identifier": "com.nekolegends.seamlessimageedit",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1440",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Seamless Image Edit",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 860,
+        "minHeight": 540,
+        "dragDropEnabled": true,
+        "resizable": true,
+        "fullscreen": false,
+        "backgroundColor": "#050505"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: blob: asset: http://asset.localhost https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Neko Legends",
+    "copyright": "Copyright © Neko Legends",
+    "icon": ["icons/icon.ico"],
+    "category": "GraphicsAndDesign",
+    "shortDescription": "Local seamless texture and tile image editor",
+    "longDescription": "Seamless Image Edit turns images into horizontally seamless, vertically seamless, or fully tileable PNG/WebP outputs."
+  }
+}
+
