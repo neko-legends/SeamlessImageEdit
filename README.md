@@ -13,7 +13,11 @@ Local desktop tool for turning source images into horizontally seamless, vertica
 
 ## Algorithm
 
-The editor offsets the source image by half the width and/or height so the original outer edges meet in the middle. It then repairs only the center blend band, leaving the new outer edges as wrapped pixels. Horizontal mode repairs left/right edges, vertical mode repairs top/bottom edges, and tile mode uses separate X/Y references so all four edges stay tileable.
+The main seam repair path uses Embark Studios' open-source `texture-synthesis` crate. The app masks the border band that needs to become tileable, asks the synthesis engine to inpaint that band with tiling mode enabled, then runs a small final edge polish so opposite outer pixels match exactly. Horizontal mode repairs left/right borders, vertical mode repairs top/bottom borders, and tile mode repairs all four borders.
+
+If texture synthesis cannot complete for a file, the backend falls back to a deterministic offset-and-blend repair so the batch can keep moving.
+
+Test fixtures are written to `src-tauri\target\visual-seam-test` during `cargo test`. They include a deliberately harsh non-seamless square, a 2x2 repeat before repair, and a 2x2 repeat after repair for visual inspection.
 
 ## Development
 
@@ -33,4 +37,3 @@ The Windows installer is written under `src-tauri\target\release\bundle\nsis`.
 ## License
 
 MIT
-

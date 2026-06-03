@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_opener::OpenerExt;
+use texture_synthesis as texsynth;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "jpe", "jfif", "webp", "bmp", "tif", "tiff",
@@ -197,6 +199,15 @@ fn edge_band(size: u32, blend_percent: f32) -> u32 {
         .min((size / 2).max(1))
 }
 
+fn synthesis_band(size: u32, blend_percent: f32) -> u32 {
+    if size <= 2 {
+        return 1;
+    }
+
+    let raw = ((size as f32) * blend_percent.clamp(8.0, 42.0) / 100.0).round() as u32;
+    raw.max(8).min((size / 3).max(1))
+}
+
 fn edge_weight(index: u32, band: u32) -> f32 {
     if band <= 1 {
         return 1.0;
@@ -204,6 +215,44 @@ fn edge_weight(index: u32, band: u32) -> f32 {
     let t = 1.0 - index as f32 / band.saturating_sub(1) as f32;
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+fn synthesis_mask(width: u32, height: u32, mode: &str, blend_percent: f32) -> RgbaImage {
+    let x_band = synthesis_band(width, blend_percent);
+    let y_band = synthesis_band(height, blend_percent);
+    let mut mask = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+
+    for y in 0..height {
+        for x in 0..width {
+            let in_horizontal_band = x < x_band || x >= width.saturating_sub(x_band);
+            let in_vertical_band = y < y_band || y >= height.saturating_sub(y_band);
+            let editable = match mode {
+                "horizontal" => in_horizontal_band,
+                "vertical" => in_vertical_band,
+                "tile" => in_horizontal_band || in_vertical_band,
+                _ => false,
+            };
+
+            if editable {
+                mask.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+            }
+        }
+    }
+
+    mask
+}
+
+fn temp_job_dir() -> Result<PathBuf, String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("System clock error: {error}"))?
+        .as_millis();
+    let dir = std::env::temp_dir().join(format!(
+        "seamless-image-edit-{}-{millis}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).map_err(|error| format!("Unable to create temp folder: {error}"))?;
+    Ok(dir)
 }
 
 fn mix2(a: Rgba<u8>, b: Rgba<u8>, weight_b: f32) -> Rgba<u8> {
@@ -353,6 +402,58 @@ fn make_seamless(source: &RgbaImage, mode: &str, blend_percent: f32) -> RgbaImag
     output
 }
 
+fn make_content_aware_seamless(
+    source: &RgbaImage,
+    mode: &str,
+    blend_percent: f32,
+) -> Result<RgbaImage, String> {
+    let temp_dir = temp_job_dir()?;
+    let source_path = temp_dir.join("source.png");
+    let mask_path = temp_dir.join("mask.png");
+    let generated_path = temp_dir.join("generated.png");
+
+    source
+        .save(&source_path)
+        .map_err(|error| format!("Unable to write synthesis source: {error}"))?;
+    synthesis_mask(source.width(), source.height(), mode, blend_percent)
+        .save(&mask_path)
+        .map_err(|error| format!("Unable to write synthesis mask: {error}"))?;
+
+    let example = texsynth::Example::builder(&source_path).set_sample_method(&mask_path);
+    let session = texsynth::Session::builder()
+        .inpaint_example(
+            &mask_path,
+            example,
+            texsynth::Dims::new(source.width(), source.height()),
+        )
+        .tiling_mode(true)
+        .seed(211)
+        .nearest_neighbors(32)
+        .random_sample_locations(32)
+        .backtrack_percent(0.35)
+        .backtrack_stages(3)
+        .build()
+        .map_err(|error| format!("Unable to build texture synthesis session: {error}"))?;
+
+    session
+        .run(None)
+        .save(&generated_path)
+        .map_err(|error| format!("Unable to save texture synthesis output: {error}"))?;
+
+    let mut generated = image::open(&generated_path)
+        .map_err(|error| format!("Unable to read texture synthesis output: {error}"))?
+        .to_rgba8();
+    let edge_polish = blend_percent.min(8.0);
+    if matches!(mode, "horizontal" | "tile") {
+        reconcile_horizontal_edges(&mut generated, edge_polish);
+    }
+    if matches!(mode, "vertical" | "tile") {
+        reconcile_vertical_edges(&mut generated, edge_polish);
+    }
+    let _ = fs::remove_dir_all(&temp_dir);
+    Ok(generated)
+}
+
 fn process_one(path: &Path, options: &SeamlessOptions) -> Result<PathBuf, String> {
     if !path.is_file() {
         return Err("Input path is not a file.".to_string());
@@ -367,7 +468,8 @@ fn process_one(path: &Path, options: &SeamlessOptions) -> Result<PathBuf, String
         return Err("Image must be at least 2x2 pixels.".to_string());
     }
 
-    let seamless = make_seamless(&image, mode, options.blend_percent);
+    let seamless = make_content_aware_seamless(&image, mode, options.blend_percent)
+        .unwrap_or_else(|_| make_seamless(&image, mode, options.blend_percent));
     let output_path = output_path_for(path, options)?;
     seamless
         .save_with_format(&output_path, image_format)
@@ -583,6 +685,14 @@ mod tests {
         tiled
     }
 
+    fn paste(target: &mut RgbaImage, source: &RgbaImage, offset_x: u32, offset_y: u32) {
+        for y in 0..source.height() {
+            for x in 0..source.width() {
+                target.put_pixel(offset_x + x, offset_y + y, *source.get_pixel(x, y));
+            }
+        }
+    }
+
     fn seam_score(image: &RgbaImage) -> f32 {
         let width = image.width();
         let height = image.height();
@@ -606,8 +716,9 @@ mod tests {
 
     #[test]
     fn writes_visual_tile_fixture_and_reduces_edge_seams() {
-        let source = harsh_nonseamless_fixture(256);
-        let output = make_seamless(&source, "tile", 22.0);
+        let source = harsh_nonseamless_fixture(160);
+        let output =
+            make_content_aware_seamless(&source, "tile", 22.0).expect("content-aware seamless");
         let source_score = seam_score(&source);
         let output_score = seam_score(&output);
         println!("visual seam score source={source_score:.2}, output={output_score:.2}");
@@ -627,11 +738,30 @@ mod tests {
         output
             .save(output_dir.join("02-output-seamless.png"))
             .expect("save seamless fixture");
-        tile_2x2(&source)
+        let source_tiled = tile_2x2(&source);
+        let output_tiled = tile_2x2(&output);
+        source_tiled
             .save(output_dir.join("03-source-tiled-2x2.png"))
             .expect("save source tiled fixture");
-        tile_2x2(&output)
+        output_tiled
             .save(output_dir.join("04-output-tiled-2x2.png"))
             .expect("save output tiled fixture");
+
+        let gutter = 12;
+        let mut contact = RgbaImage::from_pixel(
+            source_tiled.width() + output_tiled.width() + gutter,
+            source_tiled.height().max(output_tiled.height()),
+            Rgba([12, 16, 24, 255]),
+        );
+        paste(&mut contact, &source_tiled, 0, 0);
+        paste(
+            &mut contact,
+            &output_tiled,
+            source_tiled.width() + gutter,
+            0,
+        );
+        contact
+            .save(output_dir.join("05-before-after-tiled-contact.png"))
+            .expect("save visual contact sheet");
     }
 }
