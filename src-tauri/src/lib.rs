@@ -36,6 +36,153 @@ struct ProcessResult {
     message: String,
 }
 
+pub fn run_headless_cli(args: Vec<String>) -> Result<(), String> {
+    let mut options = SeamlessOptions {
+        mode: "horizontal".to_string(),
+        output_format: "webp".to_string(),
+        same_folder: false,
+        output_dir: String::new(),
+        suffix: "_seamless".to_string(),
+        recursive: false,
+        overwrite: false,
+        blend_percent: 20.0,
+    };
+    let mut input_paths: Vec<String> = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--headless" => {}
+            "--help" | "-h" => {
+                print_headless_help();
+                return Ok(());
+            }
+            "--mode" => {
+                index += 1;
+                options.mode = args
+                    .get(index)
+                    .ok_or_else(|| "--mode requires horizontal, vertical, or tile".to_string())?
+                    .clone();
+            }
+            "--format" => {
+                index += 1;
+                options.output_format = args
+                    .get(index)
+                    .ok_or_else(|| "--format requires webp or png".to_string())?
+                    .clone();
+            }
+            "--output-dir" => {
+                index += 1;
+                options.output_dir = args
+                    .get(index)
+                    .ok_or_else(|| "--output-dir requires a folder path".to_string())?
+                    .clone();
+                options.same_folder = false;
+            }
+            "--same-folder" => {
+                options.same_folder = true;
+            }
+            "--suffix" => {
+                index += 1;
+                options.suffix = args
+                    .get(index)
+                    .ok_or_else(|| "--suffix requires a filename suffix".to_string())?
+                    .clone();
+            }
+            "--recursive" => {
+                options.recursive = true;
+            }
+            "--overwrite" => {
+                options.overwrite = true;
+            }
+            "--blend" => {
+                index += 1;
+                let blend = args
+                    .get(index)
+                    .ok_or_else(|| "--blend requires a numeric percentage".to_string())?;
+                options.blend_percent = blend
+                    .parse::<f32>()
+                    .map_err(|error| format!("Invalid --blend value '{blend}': {error}"))?;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("Unknown headless option: {value}"));
+            }
+            value => {
+                input_paths.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+
+    normalized_mode(&options.mode)?;
+    normalized_format(&options.output_format)?;
+    if !options.same_folder && options.output_dir.trim().is_empty() {
+        return Err("--output-dir is required unless --same-folder is set.".to_string());
+    }
+    if input_paths.is_empty() {
+        return Err("Provide at least one input image or folder.".to_string());
+    }
+
+    let mut resolved_paths = Vec::new();
+    for path in input_paths {
+        collect_images(Path::new(&path), options.recursive, &mut resolved_paths);
+    }
+    resolved_paths.sort();
+    resolved_paths.dedup();
+    if resolved_paths.is_empty() {
+        return Err("No supported input images found.".to_string());
+    }
+
+    let results = process_paths_headless(resolved_paths, options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&results)
+            .map_err(|error| format!("Unable to serialize results: {error}"))?
+    );
+    if let Some(error) = results.iter().find(|result| result.status == "error") {
+        return Err(error.message.clone());
+    }
+    Ok(())
+}
+
+fn print_headless_help() {
+    println!(
+        "SeamlessImageEdit headless usage:\n\
+         seamless-image-edit --headless [options] <image-or-folder>...\n\n\
+         Options:\n\
+           --mode horizontal|vertical|tile   Seam direction, default horizontal\n\
+           --format webp|png                 Output format, default webp\n\
+           --output-dir <folder>             Output folder\n\
+           --same-folder                     Save beside each source image\n\
+           --suffix <suffix>                 Output filename suffix, default _seamless\n\
+           --recursive                       Recurse through input folders\n\
+           --overwrite                       Replace existing outputs\n\
+           --blend <percent>                 Seam blend band, default 20"
+    );
+}
+
+fn process_paths_headless(paths: Vec<String>, options: SeamlessOptions) -> Vec<ProcessResult> {
+    let mut results = Vec::new();
+    for path in paths {
+        let input_path = PathBuf::from(&path);
+        match process_one(&input_path, &options) {
+            Ok(output_path) => results.push(ProcessResult {
+                input_path: path,
+                output_path: Some(output_path.display().to_string()),
+                status: "done".to_string(),
+                message: "Saved".to_string(),
+            }),
+            Err(error) => results.push(ProcessResult {
+                input_path: path,
+                output_path: None,
+                status: "error".to_string(),
+                message: error,
+            }),
+        }
+    }
+    results
+}
+
 fn is_image_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -764,4 +911,5 @@ mod tests {
             .save(output_dir.join("05-before-after-tiled-contact.png"))
             .expect("save visual contact sheet");
     }
+
 }

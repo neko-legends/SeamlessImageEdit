@@ -26,6 +26,23 @@ npm install
 npm run dev
 ```
 
+## Headless CLI
+
+The desktop binary can also process images without opening the GUI:
+
+```powershell
+src-tauri\target\debug\seamless-image-edit.exe --headless `
+  --mode horizontal `
+  --format webp `
+  --output-dir D:\out `
+  --suffix _seamless `
+  --overwrite `
+  D:\textures\road.png
+```
+
+Modes are `horizontal`, `vertical`, or `tile`. Use `--recursive` for folders and
+`--same-folder` to save outputs beside each source image.
+
 ## Desktop Build
 
 ```powershell
