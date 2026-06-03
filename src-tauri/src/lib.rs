@@ -186,6 +186,26 @@ fn seam_weight(index: u32, size: u32, blend_percent: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+fn edge_band(size: u32, blend_percent: f32) -> u32 {
+    if size <= 2 {
+        return 1;
+    }
+
+    let percent = (blend_percent.clamp(4.0, 45.0) * 0.5).max(2.0);
+    (((size as f32) * percent / 100.0).round() as u32)
+        .max(1)
+        .min((size / 2).max(1))
+}
+
+fn edge_weight(index: u32, band: u32) -> f32 {
+    if band <= 1 {
+        return 1.0;
+    }
+    let t = 1.0 - index as f32 / band.saturating_sub(1) as f32;
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn mix2(a: Rgba<u8>, b: Rgba<u8>, weight_b: f32) -> Rgba<u8> {
     let weight_b = weight_b.clamp(0.0, 1.0);
     let weight_a = 1.0 - weight_b;
@@ -195,6 +215,50 @@ fn mix2(a: Rgba<u8>, b: Rgba<u8>, weight_b: f32) -> Rgba<u8> {
             ((a.0[channel] as f32 * weight_a) + (b.0[channel] as f32 * weight_b)).round() as u8;
     }
     Rgba(out)
+}
+
+fn reconcile_horizontal_edges(image: &mut RgbaImage, blend_percent: f32) {
+    let width = image.width();
+    let height = image.height();
+    let band = edge_band(width, blend_percent);
+    for y in 0..height {
+        for offset in 0..band {
+            let left_x = offset;
+            let right_x = width - 1 - offset;
+            if left_x >= right_x {
+                break;
+            }
+
+            let left = *image.get_pixel(left_x, y);
+            let right = *image.get_pixel(right_x, y);
+            let matched = mix2(left, right, 0.5);
+            let weight = edge_weight(offset, band);
+            image.put_pixel(left_x, y, mix2(left, matched, weight));
+            image.put_pixel(right_x, y, mix2(right, matched, weight));
+        }
+    }
+}
+
+fn reconcile_vertical_edges(image: &mut RgbaImage, blend_percent: f32) {
+    let width = image.width();
+    let height = image.height();
+    let band = edge_band(height, blend_percent);
+    for x in 0..width {
+        for offset in 0..band {
+            let top_y = offset;
+            let bottom_y = height - 1 - offset;
+            if top_y >= bottom_y {
+                break;
+            }
+
+            let top = *image.get_pixel(x, top_y);
+            let bottom = *image.get_pixel(x, bottom_y);
+            let matched = mix2(top, bottom, 0.5);
+            let weight = edge_weight(offset, band);
+            image.put_pixel(x, top_y, mix2(top, matched, weight));
+            image.put_pixel(x, bottom_y, mix2(bottom, matched, weight));
+        }
+    }
 }
 
 fn mix_tile(
@@ -277,6 +341,13 @@ fn make_seamless(source: &RgbaImage, mode: &str, blend_percent: f32) -> RgbaImag
 
             output.put_pixel(x, y, pixel);
         }
+    }
+
+    if matches!(mode, "horizontal" | "tile") {
+        reconcile_horizontal_edges(&mut output, blend_percent);
+    }
+    if matches!(mode, "vertical" | "tile") {
+        reconcile_vertical_edges(&mut output, blend_percent);
     }
 
     output
@@ -449,11 +520,7 @@ mod tests {
         let source = gradient(16, 12);
         let output = make_seamless(&source, "horizontal", 18.0);
         for y in 0..source.height() {
-            assert_eq!(*output.get_pixel(0, y), sample_shifted(&source, 0, y, 8, 0));
-            assert_eq!(
-                *output.get_pixel(15, y),
-                sample_shifted(&source, 15, y, 8, 0)
-            );
+            assert_eq!(*output.get_pixel(0, y), *output.get_pixel(15, y));
         }
     }
 
@@ -461,19 +528,110 @@ mod tests {
     fn tile_mode_preserves_wrapped_corners_and_repairs_center() {
         let source = gradient(16, 12);
         let output = make_seamless(&source, "tile", 18.0);
-        assert_eq!(*output.get_pixel(0, 0), sample_shifted(&source, 0, 0, 8, 6));
-        assert_eq!(
-            *output.get_pixel(15, 0),
-            sample_shifted(&source, 15, 0, 8, 6)
-        );
-        assert_eq!(
-            *output.get_pixel(0, 11),
-            sample_shifted(&source, 0, 11, 8, 6)
-        );
-        assert_eq!(
-            *output.get_pixel(15, 11),
-            sample_shifted(&source, 15, 11, 8, 6)
-        );
+        assert_eq!(*output.get_pixel(0, 0), *output.get_pixel(15, 0));
+        assert_eq!(*output.get_pixel(0, 11), *output.get_pixel(15, 11));
+        assert_eq!(*output.get_pixel(0, 0), *output.get_pixel(0, 11));
+        assert_eq!(*output.get_pixel(15, 0), *output.get_pixel(15, 11));
         assert_ne!(*output.get_pixel(8, 6), sample_shifted(&source, 8, 6, 8, 6));
+    }
+
+    fn harsh_nonseamless_fixture(size: u32) -> RgbaImage {
+        let mut image = RgbaImage::new(size, size);
+        for y in 0..size {
+            for x in 0..size {
+                let checker = if ((x / 16) + (y / 16)) % 2 == 0 {
+                    30
+                } else {
+                    95
+                };
+                let red = ((x as f32 / size as f32) * 190.0).round() as u8;
+                let green = ((y as f32 / size as f32) * 180.0).round() as u8;
+                image.put_pixel(x, y, Rgba([red.saturating_add(checker), green, 150, 255]));
+            }
+        }
+
+        for i in 0..size {
+            image.put_pixel(0, i, Rgba([255, 0, 0, 255]));
+            image.put_pixel(size - 1, i, Rgba([0, 255, 255, 255]));
+            image.put_pixel(i, 0, Rgba([255, 255, 0, 255]));
+            image.put_pixel(i, size - 1, Rgba([0, 0, 255, 255]));
+        }
+
+        for i in 20..(size - 20) {
+            image.put_pixel(i, i, Rgba([255, 255, 255, 255]));
+            image.put_pixel(size - 1 - i, i, Rgba([0, 0, 0, 255]));
+        }
+
+        image
+    }
+
+    fn tile_2x2(source: &RgbaImage) -> RgbaImage {
+        let mut tiled = RgbaImage::new(source.width() * 2, source.height() * 2);
+        for tile_y in 0..2 {
+            for tile_x in 0..2 {
+                for y in 0..source.height() {
+                    for x in 0..source.width() {
+                        tiled.put_pixel(
+                            tile_x * source.width() + x,
+                            tile_y * source.height() + y,
+                            *source.get_pixel(x, y),
+                        );
+                    }
+                }
+            }
+        }
+        tiled
+    }
+
+    fn seam_score(image: &RgbaImage) -> f32 {
+        let width = image.width();
+        let height = image.height();
+        let horizontal = (0..height)
+            .map(|y| channel_delta(*image.get_pixel(0, y), *image.get_pixel(width - 1, y)))
+            .sum::<f32>()
+            / height as f32;
+        let vertical = (0..width)
+            .map(|x| channel_delta(*image.get_pixel(x, 0), *image.get_pixel(x, height - 1)))
+            .sum::<f32>()
+            / width as f32;
+        (horizontal + vertical) / 2.0
+    }
+
+    fn channel_delta(a: Rgba<u8>, b: Rgba<u8>) -> f32 {
+        (0..3)
+            .map(|channel| (a.0[channel] as f32 - b.0[channel] as f32).abs())
+            .sum::<f32>()
+            / 3.0
+    }
+
+    #[test]
+    fn writes_visual_tile_fixture_and_reduces_edge_seams() {
+        let source = harsh_nonseamless_fixture(256);
+        let output = make_seamless(&source, "tile", 22.0);
+        let source_score = seam_score(&source);
+        let output_score = seam_score(&output);
+        println!("visual seam score source={source_score:.2}, output={output_score:.2}");
+        assert!(
+            output_score <= 0.01,
+            "expected opposite tile edges to match, source={source_score:.2}, output={output_score:.2}"
+        );
+
+        let output_dir = std::env::current_dir()
+            .expect("current dir")
+            .join("target")
+            .join("visual-seam-test");
+        std::fs::create_dir_all(&output_dir).expect("create visual seam test dir");
+        source
+            .save(output_dir.join("01-source-not-seamless.png"))
+            .expect("save source fixture");
+        output
+            .save(output_dir.join("02-output-seamless.png"))
+            .expect("save seamless fixture");
+        tile_2x2(&source)
+            .save(output_dir.join("03-source-tiled-2x2.png"))
+            .expect("save source tiled fixture");
+        tile_2x2(&output)
+            .save(output_dir.join("04-output-tiled-2x2.png"))
+            .expect("save output tiled fixture");
     }
 }
