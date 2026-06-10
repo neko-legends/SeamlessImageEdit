@@ -1,12 +1,12 @@
 use base64::{engine::general_purpose, Engine as _};
-use image::{imageops::FilterType, ImageFormat, Rgba, RgbaImage};
+use image::{imageops::FilterType, ImageEncoder, ImageFormat, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 use texture_synthesis as texsynth;
 
@@ -248,6 +248,13 @@ fn is_image_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_webp_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("webp"))
+        .unwrap_or(false)
+}
+
 fn collect_images(path: &Path, recursive: bool, output: &mut Vec<String>) {
     if path.is_file() {
         if is_image_file(path) {
@@ -289,6 +296,134 @@ fn image_mime_type(path: &Path) -> Result<&'static str, String> {
         Some(extension) => Err(format!("Unsupported preview image extension: {extension}")),
         None => Err("Preview image has no file extension.".to_string()),
     }
+}
+
+fn rgba_png_data_url(image: &RgbaImage) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut bytes)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ColorType::Rgba8.into(),
+        )
+        .map_err(|error| format!("Unable to encode temporary PNG preview: {error}"))?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+fn read_image_rgba(path: &Path) -> Result<RgbaImage, String> {
+    match image::open(path) {
+        Ok(image) => Ok(image.to_rgba8()),
+        Err(error) if is_webp_file(path) => read_webp_rgba_fallback(path).map_err(|fallback_error| {
+            format!("Unable to read image: {error}; WebP fallback failed: {fallback_error}")
+        }),
+        Err(error) => Err(format!("Unable to read image: {error}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_webp_rgba_fallback(path: &Path) -> Result<RgbaImage, String> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::{GENERIC_READ, RPC_E_CHANGED_MODE},
+            Graphics::Imaging::{
+                CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICImagingFactory,
+                IWICPalette, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
+                WICDecodeMetadataCacheOnLoad,
+            },
+            System::Com::{
+                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+                COINIT_MULTITHREADED,
+            },
+        },
+    };
+
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+
+    unsafe {
+        let com_status = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let should_uninitialize = com_status.is_ok();
+        if com_status.is_err() && com_status != RPC_E_CHANGED_MODE {
+            return Err(format!(
+                "Windows imaging initialization failed with HRESULT 0x{:08X}",
+                com_status.0 as u32
+            ));
+        }
+
+        let result = (|| {
+            let factory: IWICImagingFactory =
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|error| format!("Unable to create Windows imaging factory: {error}"))?;
+            let decoder = factory
+                .CreateDecoderFromFilename(
+                    PCWSTR::from_raw(wide_path.as_ptr()),
+                    None,
+                    GENERIC_READ,
+                    WICDecodeMetadataCacheOnLoad,
+                )
+                .map_err(|error| format!("Windows imaging could not open WebP: {error}"))?;
+            let frame = decoder
+                .GetFrame(0)
+                .map_err(|error| format!("Windows imaging could not read first WebP frame: {error}"))?;
+            let converter = factory
+                .CreateFormatConverter()
+                .map_err(|error| format!("Windows imaging could not create format converter: {error}"))?;
+            converter
+                .Initialize(
+                    &frame,
+                    &GUID_WICPixelFormat32bppRGBA,
+                    WICBitmapDitherTypeNone,
+                    None::<&IWICPalette>,
+                    0.0,
+                    WICBitmapPaletteTypeCustom,
+                )
+                .map_err(|error| format!("Windows imaging could not convert WebP to RGBA: {error}"))?;
+
+            let mut width = 0;
+            let mut height = 0;
+            converter
+                .GetSize(&mut width, &mut height)
+                .map_err(|error| format!("Windows imaging could not read WebP size: {error}"))?;
+            if width == 0 || height == 0 {
+                return Err("Windows imaging decoded an empty WebP.".to_string());
+            }
+
+            let stride = width
+                .checked_mul(4)
+                .ok_or_else(|| "WebP image is too wide to decode safely.".to_string())?;
+            let buffer_len = stride
+                .checked_mul(height)
+                .and_then(|length| usize::try_from(length).ok())
+                .ok_or_else(|| "WebP image is too large to decode safely.".to_string())?;
+            let mut pixels = vec![0; buffer_len];
+            converter
+                .CopyPixels(ptr::null(), stride, &mut pixels)
+                .map_err(|error| format!("Windows imaging could not copy WebP pixels: {error}"))?;
+
+            RgbaImage::from_raw(width, height, pixels)
+                .ok_or_else(|| "Windows imaging returned an invalid RGBA buffer.".to_string())
+        })();
+
+        if should_uninitialize {
+            CoUninitialize();
+        }
+
+        result
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_webp_rgba_fallback(_path: &Path) -> Result<RgbaImage, String> {
+    Err("no platform WebP fallback is available".to_string())
 }
 
 fn sanitized_suffix(value: &str) -> String {
@@ -1007,9 +1142,7 @@ fn process_one(path: &Path, options: &SeamlessOptions) -> Result<PathBuf, String
     let mode = normalized_mode(&options.mode)?;
     let strategy = normalized_strategy(&options.strategy)?;
     let (_, image_format) = normalized_format(&options.output_format)?;
-    let image = image::open(path)
-        .map_err(|error| format!("Unable to read image: {error}"))?
-        .to_rgba8();
+    let image = read_image_rgba(path)?;
     if image.width() < 2 || image.height() < 2 {
         return Err("Image must be at least 2x2 pixels.".to_string());
     }
@@ -1094,6 +1227,10 @@ fn preview_image_data_url(path: String) -> Result<String, String> {
     if !image_path.is_file() {
         return Err("Preview image was not found.".to_string());
     }
+    if is_webp_file(&image_path) {
+        let image = read_image_rgba(&image_path)?;
+        return rgba_png_data_url(&image);
+    }
     let mime_type = image_mime_type(&image_path)?;
     let bytes =
         fs::read(&image_path).map_err(|error| format!("Unable to read preview image: {error}"))?;
@@ -1139,6 +1276,13 @@ async fn start_seamless_job(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![

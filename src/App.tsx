@@ -18,7 +18,7 @@ import {
   Wand2,
   XCircle,
 } from 'lucide-react'
-import { CSSProperties, useCallback, useEffect, useMemo, useState } from 'react'
+import { type KeyboardEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 type SeamMode = 'horizontal' | 'vertical' | 'tile'
 type SeamStrategy = 'seam-cut' | 'synthesis' | 'blend'
@@ -63,6 +63,27 @@ type PreviewState = {
   input?: string
   output?: string
   error?: string
+}
+
+type TileCheckState = {
+  dataUrl?: string
+  path?: string
+  error?: string
+}
+
+type DropPosition = {
+  x: number
+  y: number
+}
+
+type RangeControlProps = {
+  label: string
+  value: number
+  min: number
+  max: number
+  step: number
+  valueText: string
+  onChange: (value: number) => void
 }
 
 const SETTINGS_KEY = 'seamlessImageEdit.settings.v1'
@@ -127,6 +148,17 @@ function coerceNumber(value: unknown, fallback: number, min: number, max: number
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback
 }
 
+function formatRangeValue(value: number, fallback: number, min: number, max: number, digits: number): string {
+  return coerceNumber(value, fallback, min, max).toFixed(digits)
+}
+
+function snapRangeValue(value: number, min: number, max: number, step: number): number {
+  const clamped = Math.max(min, Math.min(max, value))
+  const stepped = min + Math.round((clamped - min) / step) * step
+  const precision = Math.max(0, `${step}`.split('.')[1]?.length ?? 0)
+  return Number(Math.max(min, Math.min(max, stepped)).toFixed(precision))
+}
+
 function loadOptions(): SeamlessOptions {
   try {
     const raw = window.localStorage.getItem(SETTINGS_KEY)
@@ -172,12 +204,150 @@ function outputLabel(options: SeamlessOptions): string {
   return options.outputDir ? compactPath(options.outputDir) : 'Choose output folder'
 }
 
+function isPositionInsideElement(position: DropPosition, element: HTMLElement | null): boolean {
+  if (!element) return false
+  const scale = window.devicePixelRatio || 1
+  const x = position.x / scale
+  const y = position.y / scale
+  const rect = element.getBoundingClientRect()
+  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+}
+
+function TilePreview({ src }: { src: string }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+
+  useEffect(() => {
+    let canceled = false
+    const image = new window.Image()
+
+    image.onload = () => {
+      if (canceled) return
+      const canvas = canvasRef.current
+      const context = canvas?.getContext('2d')
+      if (!canvas || !context) return
+
+      const size = 512
+      const scale = Math.max(1, Math.min(window.devicePixelRatio || 1, 2))
+      canvas.width = Math.round(size * scale)
+      canvas.height = Math.round(size * scale)
+      context.setTransform(scale, 0, 0, scale, 0, 0)
+      context.clearRect(0, 0, size, size)
+      context.imageSmoothingEnabled = true
+
+      const tileSize = size / 2
+      for (let y = 0; y < 2; y += 1) {
+        for (let x = 0; x < 2; x += 1) {
+          context.drawImage(image, x * tileSize, y * tileSize, tileSize, tileSize)
+        }
+      }
+    }
+
+    image.src = src
+    return () => {
+      canceled = true
+    }
+  }, [src])
+
+  return <canvas className="tile-preview" ref={canvasRef} />
+}
+
+function RangeControl({ label, value, min, max, step, valueText, onChange }: RangeControlProps) {
+  const safeValue = snapRangeValue(value, min, max, step)
+  const percent = ((safeValue - min) / (max - min)) * 100
+
+  function updateFromClientX(clientX: number, element: HTMLElement) {
+    const rect = element.getBoundingClientRect()
+    const ratio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0
+    onChange(snapRangeValue(min + ratio * (max - min), min, max, step))
+  }
+
+  function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    const slider = event.currentTarget
+    const pointerId = event.pointerId
+    event.preventDefault()
+    slider.focus()
+    updateFromClientX(event.clientX, slider)
+
+    const cleanup = () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', handlePointerEnd)
+      window.removeEventListener('pointercancel', handlePointerEnd)
+    }
+
+    const handlePointerMove = (moveEvent: globalThis.PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return
+      moveEvent.preventDefault()
+      updateFromClientX(moveEvent.clientX, slider)
+    }
+
+    const handlePointerEnd = (endEvent: globalThis.PointerEvent) => {
+      if (endEvent.pointerId !== pointerId) return
+      cleanup()
+    }
+
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', handlePointerEnd)
+    window.addEventListener('pointercancel', handlePointerEnd)
+  }
+
+  function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    const largeStep = step * 5
+    const nextValue =
+      event.key === 'ArrowRight' || event.key === 'ArrowUp'
+        ? safeValue + step
+        : event.key === 'ArrowLeft' || event.key === 'ArrowDown'
+          ? safeValue - step
+          : event.key === 'PageUp'
+            ? safeValue + largeStep
+            : event.key === 'PageDown'
+              ? safeValue - largeStep
+              : event.key === 'Home'
+                ? min
+                : event.key === 'End'
+                  ? max
+                  : null
+
+    if (nextValue === null) return
+    event.preventDefault()
+    onChange(snapRangeValue(nextValue, min, max, step))
+  }
+
+  return (
+    <div className="range-field range-control">
+      <div className="range-control-head">
+        <span>{label}</span>
+        <strong>{valueText}</strong>
+      </div>
+      <div
+        aria-label={label}
+        aria-valuemax={max}
+        aria-valuemin={min}
+        aria-valuenow={safeValue}
+        aria-valuetext={valueText}
+        className="range-slider"
+        onKeyDown={handleKeyDown}
+        onPointerDown={handlePointerDown}
+        role="slider"
+        tabIndex={0}
+      >
+        <div className="range-track">
+          <div className="range-fill" style={{ width: `${percent}%` }} />
+        </div>
+        <div className="range-thumb" style={{ left: `${percent}%` }} />
+      </div>
+    </div>
+  )
+}
+
 function App() {
+  const tileCheckRef = useRef<HTMLDivElement | null>(null)
   const [options, setOptions] = useState<SeamlessOptions>(loadOptions)
   const [queue, setQueue] = useState<QueueItem[]>([])
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
   const [preview, setPreview] = useState<PreviewState>({})
+  const [tileCheck, setTileCheck] = useState<TileCheckState>({})
   const [dragging, setDragging] = useState(false)
+  const [tileCheckDragging, setTileCheckDragging] = useState(false)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('Ready')
   const [log, setLog] = useState<string[]>([])
@@ -189,6 +359,13 @@ function App() {
   const completeCount = useMemo(() => queue.filter((item) => item.status === 'done').length, [queue])
   const errorCount = useMemo(() => queue.filter((item) => item.status === 'error').length, [queue])
   const canStart = queue.length > 0 && !busy && (options.sameFolder || Boolean(options.outputDir.trim()))
+  const tileCheckImage = tileCheck.dataUrl ?? preview.output
+  const tileCheckLabel = tileCheck.path
+    ? fileName(tileCheck.path)
+    : preview.output
+      ? 'Output 2x2 repeat'
+      : 'Drop image to check'
+  const previewError = preview.error ?? tileCheck.error
 
   const pushLog = useCallback((message: string) => {
     setLog((current) => [message, ...current].slice(0, 80))
@@ -237,8 +414,47 @@ function App() {
     [options.recursive, pushLog],
   )
 
+  const loadTileCheckImage = useCallback(
+    async (paths: string[]) => {
+      if (paths.length === 0) return
+      if (!isTauriRuntime()) {
+        setNotice('Desktop runtime required for filesystem access')
+        return
+      }
+
+      try {
+        const resolved = await invoke<string[]>('resolve_inputs', {
+          paths,
+          recursive: false,
+        })
+        const imagePath = resolved[0]
+        if (!imagePath) {
+          const message = 'Tile check needs a supported image'
+          setTileCheck((current) => ({ ...current, error: message }))
+          setNotice(message)
+          pushLog(message)
+          return
+        }
+
+        const dataUrl = await invoke<string>('preview_image_data_url', { path: imagePath })
+        setTileCheck({ dataUrl, path: imagePath })
+        setNotice(`Tile check loaded ${fileName(imagePath)}`)
+        pushLog(`Tile check loaded ${fileName(imagePath)}.`)
+      } catch (error) {
+        const message = String(error)
+        setTileCheck((current) => ({ ...current, error: message }))
+        setNotice(message)
+        pushLog(`Tile check failed: ${message}`)
+      }
+    },
+    [pushLog],
+  )
+
   useEffect(() => {
-    window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(options))
+    const timeout = window.setTimeout(() => {
+      window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(options))
+    }, 160)
+    return () => window.clearTimeout(timeout)
   }, [options])
 
   useEffect(() => {
@@ -268,15 +484,24 @@ function App() {
     })
 
     const cleanupDrag = getCurrentWindow().onDragDropEvent((event) => {
-      if (event.payload.type === 'over') {
-        setDragging(true)
+      if (event.payload.type === 'enter' || event.payload.type === 'over') {
+        const isTileCheckDrop = isPositionInsideElement(event.payload.position, tileCheckRef.current)
+        setDragging(!isTileCheckDrop)
+        setTileCheckDragging(isTileCheckDrop)
       }
       if (event.payload.type === 'leave') {
         setDragging(false)
+        setTileCheckDragging(false)
       }
       if (event.payload.type === 'drop') {
+        const isTileCheckDrop = isPositionInsideElement(event.payload.position, tileCheckRef.current)
         setDragging(false)
-        void addPaths(event.payload.paths)
+        setTileCheckDragging(false)
+        if (isTileCheckDrop) {
+          void loadTileCheckImage(event.payload.paths)
+        } else {
+          void addPaths(event.payload.paths)
+        }
       }
     })
 
@@ -284,7 +509,7 @@ function App() {
       void cleanupEvents.then((unlisten) => unlisten())
       void cleanupDrag.then((unlisten) => unlisten())
     }
-  }, [addPaths, patchQueueItem, pushLog])
+  }, [addPaths, loadTileCheckImage, patchQueueItem, pushLog])
 
   useEffect(() => {
     if (!selectedItem || !isTauriRuntime()) {
@@ -426,6 +651,11 @@ function App() {
     setSelectedPath((current) => (current === path ? null : current))
   }
 
+  function clearTileCheckImage() {
+    setTileCheck({})
+    setNotice(preview.output ? 'Tile check using selected output' : 'Tile check cleared')
+  }
+
   return (
     <div className="app-shell theme-neko-tron">
       <header className="topbar">
@@ -539,34 +769,26 @@ function App() {
                 </button>
               ))}
             </div>
-            <label className="range-field">
-              <span>Seam band</span>
-              <strong>{options.blendPercent.toFixed(0)}%</strong>
-              <input
-                type="range"
-                min="4"
-                max="45"
-                step="1"
-                value={options.blendPercent}
-                onChange={(event) =>
-                  setOptions((current) => ({ ...current, blendPercent: Number(event.currentTarget.value) || current.blendPercent }))
-                }
-              />
-            </label>
-            <label className="range-field">
-              <span>Flatten</span>
-              <strong>{options.flatten.toFixed(1)}</strong>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.1"
-                value={options.flatten}
-                onChange={(event) =>
-                  setOptions((current) => ({ ...current, flatten: Number(event.currentTarget.value) || 0 }))
-                }
-              />
-            </label>
+            <RangeControl
+              label="Seam band"
+              max={45}
+              min={4}
+              onChange={(value) =>
+                setOptions((current) => (current.blendPercent === value ? current : { ...current, blendPercent: value }))
+              }
+              step={1}
+              value={options.blendPercent}
+              valueText={`${formatRangeValue(options.blendPercent, defaultOptions.blendPercent, 4, 45, 0)}%`}
+            />
+            <RangeControl
+              label="Flatten"
+              max={1}
+              min={0}
+              onChange={(value) => setOptions((current) => (current.flatten === value ? current : { ...current, flatten: value }))}
+              step={0.1}
+              value={options.flatten}
+              valueText={formatRangeValue(options.flatten, defaultOptions.flatten, 0, 1, 1)}
+            />
             <label className="toggle-row">
               <input
                 type="checkbox"
@@ -638,23 +860,27 @@ function App() {
               {preview.output ? <img src={preview.output} alt="" /> : <div className="preview-empty">Pending</div>}
             </div>
 
-            <div className="preview-panel tile-check">
+            <div className={classNames('preview-panel tile-check', tileCheckDragging && 'dragging')} ref={tileCheckRef}>
               <div className="preview-head">
-                <strong>Tile Check</strong>
-                <small>{preview.output ? '2x2 repeat' : 'Pending'}</small>
+                <div className="preview-title">
+                  <strong>2x2 Edge Check</strong>
+                  <small>{tileCheckLabel}</small>
+                </div>
+                {tileCheck.dataUrl ? (
+                  <button className="icon-button compact tile-check-clear" type="button" onClick={clearTileCheckImage} title="Use selected output">
+                    <XCircle size={14} />
+                  </button>
+                ) : null}
               </div>
-              {preview.output ? (
-                <div
-                  className="tile-preview"
-                  style={{ '--tile-image': `url(${preview.output})` } as CSSProperties}
-                />
+              {tileCheckImage ? (
+                <TilePreview src={tileCheckImage} />
               ) : (
-                <div className="preview-empty">Pending</div>
+                <div className="preview-empty">Drop image</div>
               )}
             </div>
           </section>
 
-          {preview.error ? <div className="notice-line error">{preview.error}</div> : null}
+          {previewError ? <div className="notice-line error">{previewError}</div> : null}
 
           <div className="bottom-stack">
             <section className="queue-panel">
