@@ -541,15 +541,6 @@ function App() {
             </label>
           </section>
 
-          <section className="panel-section log-panel">
-            <div className="section-title">
-              <TriangleAlert size={16} />
-              Log
-            </div>
-            <div className="log-lines">
-              {log.length === 0 ? <p>Ready.</p> : log.map((line, index) => <p key={`${line}-${index}`}>{line}</p>)}
-            </div>
-          </section>
         </aside>
 
         <section className="main-surface">
@@ -617,67 +608,79 @@ function App() {
 
           {preview.error ? <div className="notice-line error">{preview.error}</div> : null}
 
-          <section className="queue-panel">
-            <div className="queue-header">
-              <span>Image</span>
-              <span>Status</span>
-              <span>Output</span>
-              <span />
-            </div>
-            {queue.length === 0 ? (
-              <div className="empty-row">
-                <TriangleAlert size={18} />
-                No images queued.
+          <div className="bottom-stack">
+            <section className="queue-panel">
+              <div className="queue-header">
+                <span>Image</span>
+                <span>Status</span>
+                <span>Output</span>
+                <span />
               </div>
-            ) : (
-              queue.map((item) => (
-                <button
-                  type="button"
-                  className={classNames('queue-row', item.status, selectedItem?.path === item.path && 'selected')}
-                  key={item.path}
-                  onClick={() => setSelectedPath(item.path)}
-                >
-                  <span className="queue-path">
-                    <strong>{fileName(item.path)}</strong>
-                    <small>{compactPath(item.path)}</small>
-                  </span>
-                  <span className="queue-status">
-                    {statusIcon(item.status)}
-                    {item.message ?? item.status}
-                  </span>
-                  <span className="queue-output">
-                    {item.outputPath ? (
-                      <span onClick={(event) => event.stopPropagation()}>
-                        <button
-                          className="link-action"
-                          type="button"
-                          onClick={() => void openOutputFolder(item.outputPath)}
-                        >
-                          {fileName(item.outputPath)}
-                        </button>
-                      </span>
-                    ) : (
-                      'Pending'
-                    )}
-                  </span>
-                  <span className="queue-tools">
-                    <button
-                      className="icon-button compact danger"
-                      type="button"
-                      title="Remove"
-                      onClick={(event) => {
-                        event.stopPropagation()
-                        removeItem(item.path)
-                      }}
-                      disabled={busy}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </span>
-                </button>
-              ))
-            )}
-          </section>
+              {queue.length === 0 ? (
+                <div className="empty-row">
+                  <TriangleAlert size={18} />
+                  No images queued.
+                </div>
+              ) : (
+                queue.map((item) => (
+                  <button
+                    type="button"
+                    className={classNames('queue-row', item.status, selectedItem?.path === item.path && 'selected')}
+                    key={item.path}
+                    onClick={() => setSelectedPath(item.path)}
+                  >
+                    <span className="queue-path">
+                      <strong>{fileName(item.path)}</strong>
+                      <small>{compactPath(item.path)}</small>
+                    </span>
+                    <span className="queue-status">
+                      {statusIcon(item.status)}
+                      {item.message ?? item.status}
+                    </span>
+                    <span className="queue-output">
+                      {item.outputPath ? (
+                        <span onClick={(event) => event.stopPropagation()}>
+                          <button
+                            className="link-action"
+                            type="button"
+                            onClick={() => void openOutputFolder(item.outputPath)}
+                          >
+                            {fileName(item.outputPath)}
+                          </button>
+                        </span>
+                      ) : (
+                        'Pending'
+                      )}
+                    </span>
+                    <span className="queue-tools">
+                      <button
+                        className="icon-button compact danger"
+                        type="button"
+                        title="Remove"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          removeItem(item.path)
+                        }}
+                        disabled={busy}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </span>
+                  </button>
+                ))
+              )}
+            </section>
+
+            <section className="log-panel">
+              <div className="section-title">
+                <TriangleAlert size={16} />
+                Log
+              </div>
+              <div className="log-lines">
+                {log.length === 0 ? <p>Ready.</p> : log.map((line, index) => <p key={`${line}-${index}`}>{line}</p>)}
+              </div>
+            </section>
+          </div>
         </section>
       </main>
     </div>
@@ -685,4 +688,3 @@ function App() {
 }
 
 export default App
-

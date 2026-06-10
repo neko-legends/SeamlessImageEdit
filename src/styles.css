@@ -147,17 +147,18 @@ button {
 .tool-panel {
   display: grid;
   align-content: start;
-  gap: 12px;
+  gap: 8px;
   min-width: 0;
-  padding: 14px;
+  padding: 10px;
   border-right: 1px solid var(--border);
   background: color-mix(in srgb, var(--surface) 88%, #000);
-  overflow: auto;
+  overflow: hidden;
 }
 
 .panel-section,
 .preview-panel,
 .queue-panel,
+.log-panel,
 .drop-zone,
 .stats-row > div,
 .notice-line {
@@ -171,9 +172,9 @@ button {
 
 .panel-section {
   display: grid;
-  gap: 12px;
+  gap: 9px;
   min-width: 0;
-  padding: 12px;
+  padding: 10px;
 }
 
 .section-title {
@@ -221,7 +222,7 @@ button {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  min-height: 38px;
+  min-height: 34px;
   padding: 0 10px;
   background: var(--surface-2);
   border-color: var(--border);
@@ -252,7 +253,7 @@ button {
 .field,
 .range-field {
   display: grid;
-  gap: 7px;
+  gap: 5px;
   min-width: 0;
 }
 
@@ -385,8 +386,8 @@ input[type="range"] {
 }
 
 .main-surface {
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto minmax(130px, 0.42fr);
+  display: flex;
+  flex-direction: column;
   gap: 12px;
   min-width: 0;
   min-height: 0;
@@ -468,6 +469,7 @@ input[type="range"] {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
+  flex: 1 1 0;
   min-height: 0;
 }
 
@@ -552,7 +554,16 @@ input[type="range"] {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
-  overflow: hidden;
+  overflow: auto;
+}
+
+.bottom-stack {
+  display: grid;
+  grid-template-rows: minmax(104px, 1fr) 128px;
+  gap: 12px;
+  flex: 0 0 286px;
+  min-width: 0;
+  min-height: 0;
 }
 
 .queue-header,
@@ -656,15 +667,19 @@ input[type="range"] {
 }
 
 .log-panel {
-  min-height: 150px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  padding: 12px;
 }
 
 .log-lines {
   display: grid;
   align-content: start;
   gap: 6px;
-  max-height: 180px;
   min-width: 0;
+  min-height: 0;
   overflow: auto;
 }
 
@@ -711,6 +726,11 @@ input[type="range"] {
     overflow: visible;
   }
 
+  .bottom-stack {
+    flex-basis: auto;
+    grid-template-rows: auto auto;
+  }
+
   .preview-grid {
     grid-template-columns: 1fr;
   }
@@ -728,4 +748,3 @@ input[type="range"] {
     grid-column: 1 / -1;
   }
 }
-
