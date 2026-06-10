@@ -1301,16 +1301,17 @@ mod tests {
 
     fn illumination_gradient(width: u32, height: u32) -> RgbaImage {
         let mut image = RgbaImage::new(width, height);
-        let center_x = (width.saturating_sub(1)) as f32 * 0.35;
+        let center_x = 0.0;
         let center_y = (height.saturating_sub(1)) as f32 * 0.5;
-        let max_distance = (center_x.powi(2) + center_y.powi(2)).sqrt().max(1.0);
+        let max_distance = ((width.saturating_sub(1) as f32 - center_x).powi(2) + center_y.powi(2))
+            .sqrt()
+            .max(1.0);
         for y in 0..height {
             for x in 0..width {
                 let distance = ((x as f32 - center_x).powi(2) + (y as f32 - center_y).powi(2))
                     .sqrt()
                     / max_distance;
-                let horizontal = x as f32 / width.max(1) as f32;
-                let shade = (178.0 - 72.0 * distance + 46.0 * horizontal).clamp(30.0, 240.0) as u8;
+                let shade = (220.0 - 140.0 * distance).clamp(30.0, 240.0) as u8;
                 image.put_pixel(x, y, Rgba([shade, shade.saturating_add(8), shade, 255]));
             }
         }
