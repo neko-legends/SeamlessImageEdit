@@ -21,6 +21,7 @@ import {
 import { CSSProperties, useCallback, useEffect, useMemo, useState } from 'react'
 
 type SeamMode = 'horizontal' | 'vertical' | 'tile'
+type SeamStrategy = 'seam-cut' | 'synthesis' | 'blend'
 type OutputFormat = 'webp' | 'png'
 type QueueStatus = 'pending' | 'running' | 'done' | 'error'
 
@@ -33,6 +34,8 @@ type SeamlessOptions = {
   recursive: boolean
   overwrite: boolean
   blendPercent: number
+  strategy: SeamStrategy
+  flatten: number
 }
 
 type QueueItem = {
@@ -73,12 +76,20 @@ const defaultOptions: SeamlessOptions = {
   recursive: true,
   overwrite: false,
   blendPercent: 18,
+  strategy: 'seam-cut',
+  flatten: 0,
 }
 
 const modeOptions: Array<{ id: SeamMode; label: string; icon: typeof ArrowLeftRight }> = [
   { id: 'horizontal', label: 'Horizontal', icon: ArrowLeftRight },
   { id: 'vertical', label: 'Vertical', icon: ArrowUpDown },
   { id: 'tile', label: 'Tile', icon: Grid3X3 },
+]
+
+const strategyOptions: Array<{ id: SeamStrategy; label: string }> = [
+  { id: 'seam-cut', label: 'Seam cut' },
+  { id: 'synthesis', label: 'Synthesis' },
+  { id: 'blend', label: 'Blend' },
 ]
 
 const imageFilters = [
@@ -104,6 +115,10 @@ function coerceFormat(value: unknown): OutputFormat {
   return value === 'png' || value === 'webp' ? value : defaultOptions.outputFormat
 }
 
+function coerceStrategy(value: unknown): SeamStrategy {
+  return value === 'synthesis' || value === 'blend' || value === 'seam-cut' ? value : defaultOptions.strategy
+}
+
 function coerceBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback
 }
@@ -126,6 +141,8 @@ function loadOptions(): SeamlessOptions {
       recursive: coerceBoolean(parsed.recursive, defaultOptions.recursive),
       overwrite: coerceBoolean(parsed.overwrite, defaultOptions.overwrite),
       blendPercent: coerceNumber(parsed.blendPercent, defaultOptions.blendPercent, 4, 45),
+      strategy: coerceStrategy(parsed.strategy),
+      flatten: coerceNumber(parsed.flatten, defaultOptions.flatten, 0, 1),
     }
   } catch {
     return defaultOptions
@@ -509,8 +526,21 @@ function App() {
               <Grid3X3 size={16} />
               Tuning
             </div>
+            <div className="strategy-toggle">
+              {strategyOptions.map((strategy) => (
+                <button
+                  className={classNames('strategy-button', options.strategy === strategy.id && 'active')}
+                  type="button"
+                  key={strategy.id}
+                  onClick={() => setOptions((current) => ({ ...current, strategy: strategy.id }))}
+                  title={`${strategy.label} strategy`}
+                >
+                  {strategy.label}
+                </button>
+              ))}
+            </div>
             <label className="range-field">
-              <span>Blend band</span>
+              <span>Seam band</span>
               <strong>{options.blendPercent.toFixed(0)}%</strong>
               <input
                 type="range"
@@ -520,6 +550,20 @@ function App() {
                 value={options.blendPercent}
                 onChange={(event) =>
                   setOptions((current) => ({ ...current, blendPercent: Number(event.currentTarget.value) || current.blendPercent }))
+                }
+              />
+            </label>
+            <label className="range-field">
+              <span>Flatten</span>
+              <strong>{options.flatten.toFixed(1)}</strong>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.1"
+                value={options.flatten}
+                onChange={(event) =>
+                  setOptions((current) => ({ ...current, flatten: Number(event.currentTarget.value) || 0 }))
                 }
               />
             </label>
@@ -560,6 +604,10 @@ function App() {
             <div>
               <span>{options.mode}</span>
               mode
+            </div>
+            <div>
+              <span>{options.strategy}</span>
+              strategy
             </div>
           </div>
 
