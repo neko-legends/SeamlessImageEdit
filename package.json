@@ -1,7 +1,7 @@
 {
   "name": "seamless-image-edit",
   "private": true,
-  "version": "0.1.0",
+  "version": "26.6.11",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -29,4 +29,3 @@
     "vite": "7.3.3"
   }
 }
-

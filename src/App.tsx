@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { open } from '@tauri-apps/plugin-dialog'
+import packageInfo from '../package.json'
 import {
   ArrowLeftRight,
   ArrowUpDown,
@@ -97,6 +98,7 @@ type ToggleControlProps = {
 
 const LEGACY_SETTINGS_KEY = 'seamlessImageEdit.settings.v1'
 const SETTINGS_KEY = 'seamlessImageEdit.settings.v2'
+const APP_VERSION = `v${packageInfo.version}`
 
 const defaultOptions: SeamlessOptions = {
   mode: 'tile',
@@ -706,7 +708,10 @@ function App() {
         <div className="brand-lockup">
           <div className="brand-icon">SI</div>
           <div>
-            <h1>Seamless Image Edit</h1>
+            <div className="brand-title-row">
+              <h1>Seamless Image Edit</h1>
+              <span>{APP_VERSION}</span>
+            </div>
             <p>{notice}</p>
           </div>
         </div>
