@@ -79,6 +79,7 @@ type DropPosition = {
 
 type RangeControlProps = {
   label: string
+  title?: string
   value: number
   min: number
   max: number
@@ -87,10 +88,18 @@ type RangeControlProps = {
   onChange: (value: number) => void
 }
 
-const SETTINGS_KEY = 'seamlessImageEdit.settings.v1'
+type ToggleControlProps = {
+  checked: boolean
+  label: string
+  title?: string
+  onChange: (checked: boolean) => void
+}
+
+const LEGACY_SETTINGS_KEY = 'seamlessImageEdit.settings.v1'
+const SETTINGS_KEY = 'seamlessImageEdit.settings.v2'
 
 const defaultOptions: SeamlessOptions = {
-  mode: 'horizontal',
+  mode: 'tile',
   outputFormat: 'webp',
   sameFolder: true,
   outputDir: '',
@@ -104,15 +113,27 @@ const defaultOptions: SeamlessOptions = {
 }
 
 const modeOptions: Array<{ id: SeamMode; label: string; icon: typeof ArrowLeftRight }> = [
+  { id: 'tile', label: 'Tile', icon: Grid3X3 },
   { id: 'horizontal', label: 'Horizontal', icon: ArrowLeftRight },
   { id: 'vertical', label: 'Vertical', icon: ArrowUpDown },
-  { id: 'tile', label: 'Tile', icon: Grid3X3 },
 ]
 
-const strategyOptions: Array<{ id: SeamStrategy; label: string }> = [
-  { id: 'seam-cut', label: 'Seam cut' },
-  { id: 'synthesis', label: 'Synthesis' },
-  { id: 'blend', label: 'Blend' },
+const strategyOptions: Array<{ id: SeamStrategy; label: string; title: string }> = [
+  {
+    id: 'seam-cut',
+    label: 'Seam cut',
+    title: 'Best first choice for structured patterns: bricks, tiles, planks, grids, stripes, and fabric.',
+  },
+  {
+    id: 'synthesis',
+    label: 'Synthesis',
+    title: 'Best for organic textures: grass, moss, dirt, gravel, bark, foliage, stone, clouds, and noise.',
+  },
+  {
+    id: 'blend',
+    label: 'Blend',
+    title: 'Fast soft crossfade for blurry, low-detail, or almost-seamless images. Weak for bricks, stripes, text, or visible geometry.',
+  },
 ]
 
 const imageFilters = [
@@ -164,10 +185,11 @@ function snapRangeValue(value: number, min: number, max: number, step: number): 
 function loadOptions(): SeamlessOptions {
   try {
     const raw = window.localStorage.getItem(SETTINGS_KEY)
-    if (!raw) return defaultOptions
-    const parsed = JSON.parse(raw) as Partial<SeamlessOptions>
+    const legacyRaw = raw ? null : window.localStorage.getItem(LEGACY_SETTINGS_KEY)
+    if (!raw && !legacyRaw) return defaultOptions
+    const parsed = JSON.parse(raw ?? legacyRaw ?? '{}') as Partial<SeamlessOptions>
     return {
-      mode: coerceMode(parsed.mode),
+      mode: raw ? coerceMode(parsed.mode) : defaultOptions.mode,
       outputFormat: coerceFormat(parsed.outputFormat),
       sameFolder: coerceBoolean(parsed.sameFolder, defaultOptions.sameFolder),
       outputDir: typeof parsed.outputDir === 'string' ? parsed.outputDir : defaultOptions.outputDir,
@@ -254,7 +276,7 @@ function TilePreview({ src }: { src: string }) {
   return <canvas className="tile-preview" ref={canvasRef} />
 }
 
-function RangeControl({ label, value, min, max, step, valueText, onChange }: RangeControlProps) {
+function RangeControl({ label, title, value, min, max, step, valueText, onChange }: RangeControlProps) {
   const safeValue = snapRangeValue(value, min, max, step)
   const percent = ((safeValue - min) / (max - min)) * 100
 
@@ -316,7 +338,7 @@ function RangeControl({ label, value, min, max, step, valueText, onChange }: Ran
   }
 
   return (
-    <div className="range-field range-control">
+    <div className="range-field range-control" title={title}>
       <div className="range-control-head">
         <span>{label}</span>
         <strong>{valueText}</strong>
@@ -339,6 +361,24 @@ function RangeControl({ label, value, min, max, step, valueText, onChange }: Ran
         <div className="range-thumb" style={{ left: `${percent}%` }} />
       </div>
     </div>
+  )
+}
+
+function ToggleControl({ checked, label, title, onChange }: ToggleControlProps) {
+  return (
+    <button
+      aria-checked={checked}
+      className={classNames('toggle-row', 'toggle-control', checked && 'active')}
+      onClick={() => onChange(!checked)}
+      role="switch"
+      title={title}
+      type="button"
+    >
+      <span className="toggle-switch" aria-hidden="true">
+        <span />
+      </span>
+      <span className="toggle-label">{label}</span>
+    </button>
   )
 }
 
@@ -456,6 +496,7 @@ function App() {
   useEffect(() => {
     const timeout = window.setTimeout(() => {
       window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(options))
+      window.localStorage.removeItem(LEGACY_SETTINGS_KEY)
     }, 160)
     return () => window.clearTimeout(timeout)
   }, [options])
@@ -471,7 +512,7 @@ function App() {
       if (payload.type === 'image_done' && payload.path) {
         patchQueueItem(payload.path, {
           status: 'done',
-          message: 'Saved',
+          message: payload.message ?? 'Saved',
           outputPath: payload.output,
         })
         setSelectedPath(payload.path)
@@ -731,14 +772,11 @@ function App() {
                 </button>
               ))}
             </div>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={options.sameFolder}
-                onChange={(event) => setOptions((current) => ({ ...current, sameFolder: event.currentTarget.checked }))}
-              />
-              <span>Save beside source</span>
-            </label>
+            <ToggleControl
+              checked={options.sameFolder}
+              label="Save beside source"
+              onChange={(checked) => setOptions((current) => ({ ...current, sameFolder: checked }))}
+            />
             <div className="folder-row">
               <input value={outputLabel(options)} readOnly disabled={options.sameFolder} />
               <button className="icon-button compact" type="button" onClick={chooseOutputFolder} title="Choose output folder">
@@ -766,7 +804,7 @@ function App() {
                   type="button"
                   key={strategy.id}
                   onClick={() => setOptions((current) => ({ ...current, strategy: strategy.id }))}
-                  title={`${strategy.label} strategy`}
+                  title={strategy.title}
                 >
                   {strategy.label}
                 </button>
@@ -780,6 +818,7 @@ function App() {
                 setOptions((current) => (current.blendPercent === value ? current : { ...current, blendPercent: value }))
               }
               step={1}
+              title="How wide the repaired edge area is. Lower keeps more original detail; higher hides bigger edge mismatches but can soften the texture."
               value={options.blendPercent}
               valueText={`${formatRangeValue(options.blendPercent, defaultOptions.blendPercent, 4, 45, 0)}%`}
             />
@@ -789,33 +828,26 @@ function App() {
               min={0}
               onChange={(value) => setOptions((current) => (current.flatten === value ? current : { ...current, flatten: value }))}
               step={0.1}
+              title="Reduces broad lighting gradients before seam repair. Use a little for photos with vignettes or directional light; leave low for already-even textures."
               value={options.flatten}
               valueText={formatRangeValue(options.flatten, defaultOptions.flatten, 0, 1, 1)}
             />
-            <label className="toggle-row" title="Detect repeating patterns (bricks, tiles) and crop to a whole number of repeats so no partial bricks appear when tiling">
-              <input
-                type="checkbox"
-                checked={options.snapPeriod}
-                onChange={(event) => setOptions((current) => ({ ...current, snapPeriod: event.currentTarget.checked }))}
-              />
-              <span>Snap to pattern repeat</span>
-            </label>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={options.recursive}
-                onChange={(event) => setOptions((current) => ({ ...current, recursive: event.currentTarget.checked }))}
-              />
-              <span>Scan folders recursively</span>
-            </label>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={options.overwrite}
-                onChange={(event) => setOptions((current) => ({ ...current, overwrite: event.currentTarget.checked }))}
-              />
-              <span>Overwrite outputs</span>
-            </label>
+            <ToggleControl
+              checked={options.snapPeriod}
+              label="Snap to pattern repeat"
+              onChange={(checked) => setOptions((current) => ({ ...current, snapPeriod: checked }))}
+              title="Detect repeating patterns (bricks, tiles) and crop to a whole number of repeats so no partial bricks appear when tiling"
+            />
+            <ToggleControl
+              checked={options.recursive}
+              label="Scan folders recursively"
+              onChange={(checked) => setOptions((current) => ({ ...current, recursive: checked }))}
+            />
+            <ToggleControl
+              checked={options.overwrite}
+              label="Overwrite outputs"
+              onChange={(checked) => setOptions((current) => ({ ...current, overwrite: checked }))}
+            />
           </section>
 
         </aside>
