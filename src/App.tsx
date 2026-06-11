@@ -55,10 +55,20 @@ type ProcessResult = {
 }
 
 type WorkerEvent = {
-  type: 'image_start' | 'image_done' | 'image_error' | 'done'
+  type: 'image_start' | 'image_done' | 'image_error' | 'done' | 'canceled'
   path?: string
   output?: string
   message?: string
+}
+
+type AgentServerStatus = {
+  enabled: boolean
+  port: number
+  url: string
+  openapiUrl: string
+  busy: boolean
+  activeJobId: string | null
+  message: string
 }
 
 type PreviewState = {
@@ -98,6 +108,9 @@ type ToggleControlProps = {
 
 const LEGACY_SETTINGS_KEY = 'seamlessImageEdit.settings.v1'
 const SETTINGS_KEY = 'seamlessImageEdit.settings.v2'
+const AGENT_STORAGE_KEY = 'seamlessImageEdit.agentControlEnabled.v1'
+const AGENT_PORT_STORAGE_KEY = 'seamlessImageEdit.agentApiPort.v1'
+const DEFAULT_AGENT_API_PORT = 17335
 const APP_VERSION = `v${packageInfo.version}`
 
 const defaultOptions: SeamlessOptions = {
@@ -147,6 +160,11 @@ const imageFilters = [
 
 function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+}
+
+function normalizeAgentPort(value: string) {
+  const port = Number(value)
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null
 }
 
 function classNames(...items: Array<string | false | null | undefined>): string {
@@ -396,6 +414,13 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('Ready')
   const [log, setLog] = useState<string[]>([])
+  const [agentControlEnabled, setAgentControlEnabled] = useState(
+    () => window.localStorage.getItem(AGENT_STORAGE_KEY) === '1',
+  )
+  const [agentPort, setAgentPort] = useState(
+    () => window.localStorage.getItem(AGENT_PORT_STORAGE_KEY) ?? String(DEFAULT_AGENT_API_PORT),
+  )
+  const [agentStatus, setAgentStatus] = useState<AgentServerStatus | null>(null)
 
   const selectedItem = useMemo(
     () => queue.find((item) => item.path === selectedPath) ?? queue[0] ?? null,
@@ -415,6 +440,67 @@ function App() {
   const pushLog = useCallback((message: string) => {
     setLog((current) => [message, ...current].slice(0, 80))
   }, [])
+
+  const refreshAgentStatus = useCallback(async () => {
+    if (!isTauriRuntime()) return
+    const status = await invoke<AgentServerStatus>('get_agent_server_status')
+    setAgentStatus(status)
+    if (status.enabled || !window.localStorage.getItem(AGENT_PORT_STORAGE_KEY)) {
+      setAgentPort(String(status.port || DEFAULT_AGENT_API_PORT))
+    }
+  }, [])
+
+  const toggleAgentControl = useCallback(
+    async (enabled: boolean) => {
+      const port = normalizeAgentPort(agentPort)
+      if (enabled && port === null) {
+        setNotice('Choose an Agent API port between 1 and 65535')
+        return
+      }
+      setAgentControlEnabled(enabled)
+      window.localStorage.setItem(AGENT_STORAGE_KEY, enabled ? '1' : '0')
+      if (port !== null) {
+        window.localStorage.setItem(AGENT_PORT_STORAGE_KEY, String(port))
+      }
+      if (!isTauriRuntime()) return
+      try {
+        const status = await invoke<AgentServerStatus>('set_agent_server_enabled', {
+          enabled,
+          port: port ?? agentStatus?.port ?? DEFAULT_AGENT_API_PORT,
+        })
+        setAgentStatus(status)
+        setAgentPort(String(status.port))
+        setNotice(status.message)
+        pushLog(status.message)
+      } catch (error) {
+        setAgentControlEnabled(false)
+        window.localStorage.setItem(AGENT_STORAGE_KEY, '0')
+        setNotice(String(error))
+        pushLog(String(error))
+      }
+    },
+    [agentPort, agentStatus?.port, pushLog],
+  )
+
+  const applyAgentPort = useCallback(async () => {
+    const port = normalizeAgentPort(agentPort)
+    if (port === null) {
+      setNotice('Choose an Agent API port between 1 and 65535')
+      return
+    }
+    window.localStorage.setItem(AGENT_PORT_STORAGE_KEY, String(port))
+    if (!isTauriRuntime() || !agentControlEnabled) return
+    try {
+      const status = await invoke<AgentServerStatus>('set_agent_server_enabled', { enabled: true, port })
+      setAgentStatus(status)
+      setAgentPort(String(status.port))
+      setNotice(`Agent API moved to ${status.url}`)
+      pushLog(`Agent API moved to ${status.url}`)
+    } catch (error) {
+      setNotice(String(error))
+      pushLog(String(error))
+    }
+  }, [agentControlEnabled, agentPort, pushLog])
 
   const patchQueueItem = useCallback((path: string, patch: Partial<QueueItem>) => {
     setQueue((current) => current.map((item) => (item.path === path ? { ...item, ...patch } : item)))
@@ -505,6 +591,29 @@ function App() {
 
   useEffect(() => {
     if (!isTauriRuntime()) return
+    void refreshAgentStatus().catch((error) => {
+      pushLog(`Agent API check failed: ${String(error)}`)
+    })
+  }, [pushLog, refreshAgentStatus])
+
+  useEffect(() => {
+    if (!isTauriRuntime() || !agentControlEnabled) return
+    const port = normalizeAgentPort(agentPort) ?? DEFAULT_AGENT_API_PORT
+    void invoke<AgentServerStatus>('set_agent_server_enabled', { enabled: true, port })
+      .then((status) => {
+        setAgentStatus(status)
+        setAgentPort(String(status.port))
+      })
+      .catch((error) => {
+        setAgentControlEnabled(false)
+        window.localStorage.setItem(AGENT_STORAGE_KEY, '0')
+        setNotice(`Agent API failed to start: ${String(error)}`)
+        pushLog(`Agent API failed to start: ${String(error)}`)
+      })
+  }, [agentControlEnabled, agentPort, pushLog])
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return
 
     const cleanupEvents = listen<WorkerEvent>('seamless-worker-event', (event) => {
       const payload = event.payload
@@ -523,6 +632,13 @@ function App() {
       if (payload.type === 'image_error' && payload.path) {
         patchQueueItem(payload.path, { status: 'error', message: payload.message ?? 'Failed' })
         pushLog(`${fileName(payload.path)} failed: ${payload.message ?? 'Unknown error'}`)
+      }
+      if (payload.type === 'canceled') {
+        setQueue((current) =>
+          current.map((item) => (item.status === 'pending' || item.status === 'running' ? { ...item, status: 'error', message: 'Canceled' } : item)),
+        )
+        setNotice(payload.message ?? 'Seamless job canceled')
+        setBusy(false)
       }
       if (payload.type === 'done') {
         setBusy(false)
@@ -795,6 +911,40 @@ function App() {
                 onChange={(event) => setOptions((current) => ({ ...current, suffix: event.currentTarget.value }))}
               />
             </label>
+          </section>
+
+          <section className="panel-section">
+            <div className="section-title">
+              <Wand2 size={16} />
+              Agent API
+            </div>
+            <ToggleControl
+              checked={agentControlEnabled}
+              label="Enable local API"
+              onChange={(checked) => void toggleAgentControl(checked)}
+            />
+            <label className="field">
+              <span>API port</span>
+              <input
+                type="number"
+                min="1"
+                max="65535"
+                value={agentPort}
+                onChange={(event) => setAgentPort(event.currentTarget.value)}
+                onBlur={() => void applyAgentPort()}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.currentTarget.blur()
+                  }
+                }}
+              />
+            </label>
+            {agentStatus?.enabled ? (
+              <div className="agent-status">
+                <span>{agentStatus.url}</span>
+                <small>OpenAPI: {agentStatus.openapiUrl}</small>
+              </div>
+            ) : null}
           </section>
 
           <section className="panel-section">

@@ -3,10 +3,17 @@ use image::{imageops::FilterType, ImageEncoder, ImageFormat, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use texture_synthesis as texsynth;
 
@@ -14,6 +21,7 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "jpe", "jfif", "webp", "bmp", "tif", "tiff",
 ];
 const SEAM_FEATHER: i32 = 3;
+const DEFAULT_AGENT_API_PORT: u16 = 17335;
 
 fn default_mode() -> String {
     "tile".to_string()
@@ -74,6 +82,152 @@ struct ProcessResult {
 struct ProcessedOutput {
     output_path: PathBuf,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentJobRequest {
+    paths: Option<Vec<String>>,
+    options: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentServerStatus {
+    enabled: bool,
+    port: u16,
+    url: String,
+    openapi_url: String,
+    busy: bool,
+    active_job_id: Option<String>,
+    message: String,
+}
+
+#[derive(Clone, Default)]
+struct ActiveJobState {
+    inner: Arc<Mutex<Option<ActiveJob>>>,
+}
+
+struct ActiveJob {
+    id: String,
+    cancel_requested: bool,
+}
+
+impl ActiveJobState {
+    fn is_busy(&self) -> Result<bool, String> {
+        self.inner
+            .lock()
+            .map(|job| job.is_some())
+            .map_err(|_| "Unable to lock active job state.".to_string())
+    }
+
+    fn start(&self, id: String) -> Result<(), String> {
+        let mut active = self
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock active job state.".to_string())?;
+        if active.is_some() {
+            return Err("Another seamless job is already running.".to_string());
+        }
+        *active = Some(ActiveJob {
+            id,
+            cancel_requested: false,
+        });
+        Ok(())
+    }
+
+    fn request_cancel(&self) -> Result<(), String> {
+        let mut active = self
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock active job state.".to_string())?;
+        let Some(job) = active.as_mut() else {
+            return Err("No active seamless job to cancel.".to_string());
+        };
+        job.cancel_requested = true;
+        Ok(())
+    }
+
+    fn is_canceled(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|job| {
+                job.as_ref()
+                    .filter(|job| job.id == id)
+                    .map(|job| job.cancel_requested)
+            })
+            .unwrap_or(true)
+    }
+
+    fn finish(&self, id: &str) -> Result<bool, String> {
+        let mut active = self
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock active job state.".to_string())?;
+        let canceled = active
+            .as_ref()
+            .filter(|job| job.id == id)
+            .map(|job| job.cancel_requested)
+            .unwrap_or(false);
+        if active.as_ref().is_some_and(|job| job.id == id) {
+            *active = None;
+        }
+        Ok(canceled)
+    }
+
+    fn active_job_id(&self) -> Result<Option<String>, String> {
+        self.inner
+            .lock()
+            .map(|job| job.as_ref().map(|job| job.id.clone()))
+            .map_err(|_| "Unable to lock active job state.".to_string())
+    }
+}
+
+#[derive(Clone, Default)]
+struct AgentServerState {
+    inner: Arc<Mutex<AgentServerControl>>,
+}
+
+#[derive(Default)]
+struct AgentServerControl {
+    enabled: bool,
+    port: u16,
+    stop: Option<Arc<AtomicBool>>,
+}
+
+impl AgentServerControl {
+    fn port(&self) -> u16 {
+        if self.port == 0 {
+            DEFAULT_AGENT_API_PORT
+        } else {
+            self.port
+        }
+    }
+}
+
+fn default_seamless_options() -> SeamlessOptions {
+    SeamlessOptions {
+        mode: default_mode(),
+        output_format: default_output_format(),
+        same_folder: true,
+        output_dir: String::new(),
+        suffix: default_suffix(),
+        recursive: true,
+        overwrite: false,
+        blend_percent: default_blend_percent(),
+        strategy: default_strategy(),
+        flatten: 0.0,
+        snap_period: false,
+    }
+}
+
+fn next_job_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("job-{millis}")
 }
 
 pub fn run_headless_cli(args: Vec<String>) -> Result<(), String> {
@@ -1444,11 +1598,16 @@ fn process_one(path: &Path, options: &SeamlessOptions) -> Result<ProcessedOutput
 
 fn process_paths(
     app: AppHandle,
+    active_jobs: ActiveJobState,
+    job_id: String,
     paths: Vec<String>,
     options: SeamlessOptions,
 ) -> Result<Vec<ProcessResult>, String> {
     let mut results = Vec::new();
     for path in paths {
+        if active_jobs.is_canceled(&job_id) {
+            break;
+        }
         let _ = app.emit(
             "seamless-worker-event",
             serde_json::json!({ "type": "image_start", "path": path }),
@@ -1484,10 +1643,13 @@ fn process_paths(
         }
     }
 
-    let _ = app.emit(
-        "seamless-worker-event",
-        serde_json::json!({ "type": "done" }),
-    );
+    let was_canceled = active_jobs.finish(&job_id)?;
+    let event = if was_canceled {
+        serde_json::json!({ "type": "canceled", "message": "Seamless job canceled." })
+    } else {
+        serde_json::json!({ "type": "done" })
+    };
+    let _ = app.emit("seamless-worker-event", event);
     Ok(results)
 }
 
@@ -1543,20 +1705,374 @@ fn open_containing_folder(app: AppHandle, path: String) -> Result<(), String> {
 #[tauri::command]
 async fn start_seamless_job(
     app: AppHandle,
+    active_jobs: State<'_, ActiveJobState>,
     paths: Vec<String>,
     options: SeamlessOptions,
 ) -> Result<Vec<ProcessResult>, String> {
     if paths.is_empty() {
         return Err("No input images were provided.".to_string());
     }
+    let job_id = next_job_id();
+    active_jobs.start(job_id.clone())?;
+    let active_jobs = active_jobs.inner().clone();
 
-    tauri::async_runtime::spawn_blocking(move || process_paths(app, paths, options))
+    tauri::async_runtime::spawn_blocking(move || process_paths(app, active_jobs, job_id, paths, options))
         .await
         .map_err(|error| format!("Seamless worker failed: {error}"))?
 }
 
+#[tauri::command]
+fn cancel_active_job(active_jobs: State<'_, ActiveJobState>) -> Result<(), String> {
+    active_jobs.request_cancel()
+}
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+fn validate_agent_api_port(port: Option<u16>) -> Result<u16, String> {
+    let port = port.unwrap_or(DEFAULT_AGENT_API_PORT);
+    if port == 0 {
+        return Err("Agent API port must be between 1 and 65535.".to_string());
+    }
+    Ok(port)
+}
+
+fn agent_api_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+fn agent_status_from(
+    agent_state: &AgentServerState,
+    active_jobs: &ActiveJobState,
+) -> Result<AgentServerStatus, String> {
+    let (enabled, port) = {
+        let control = agent_state
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock agent server state.".to_string())?;
+        (control.enabled, control.port())
+    };
+    let busy = active_jobs.is_busy()?;
+    let active_job_id = active_jobs.active_job_id()?;
+    Ok(AgentServerStatus {
+        enabled,
+        port,
+        url: agent_api_url(port),
+        openapi_url: format!("{}/openapi.json", agent_api_url(port)),
+        busy,
+        active_job_id,
+        message: if enabled {
+            "Agent API is enabled.".to_string()
+        } else {
+            "Agent API is off.".to_string()
+        },
+    })
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("Unable to set read timeout: {error}"))?;
+    let mut data = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let mut expected_len: Option<usize> = None;
+
+    loop {
+        let bytes_read = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("Unable to read agent request: {error}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        data.extend_from_slice(&buffer[..bytes_read]);
+        if let Some(header_end) = find_header_end(&data) {
+            if expected_len.is_none() {
+                let headers = String::from_utf8_lossy(&data[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                expected_len = Some(header_end + 4 + content_length);
+            }
+            if expected_len.is_some_and(|len| data.len() >= len) {
+                break;
+            }
+        }
+        if data.len() > 2 * 1024 * 1024 {
+            return Err("Agent request is too large.".to_string());
+        }
+    }
+
+    let header_end = find_header_end(&data).ok_or_else(|| "Invalid HTTP request.".to_string())?;
+    let headers = String::from_utf8_lossy(&data[..header_end]);
+    let mut lines = headers.lines();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "Invalid HTTP request line.".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let raw_path = parts.next().unwrap_or("/").to_string();
+    let path = raw_path.split('?').next().unwrap_or("/").to_string();
+    let body_start = header_end + 4;
+    let body = if body_start <= data.len() {
+        data[body_start..].to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(HttpRequest { method, path, body })
+}
+
+fn write_json_response(
+    stream: &mut TcpStream,
+    status: &str,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    let body = serde_json::to_vec(&payload)
+        .map_err(|error| format!("Unable to serialize agent response: {error}"))?;
+    let headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .and_then(|_| stream.write_all(&body))
+        .map_err(|error| format!("Unable to write agent response: {error}"))
+}
+
+fn write_empty_response(stream: &mut TcpStream, status: &str) -> Result<(), String> {
+    let headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .map_err(|error| format!("Unable to write agent response: {error}"))
+}
+
+fn agent_openapi(port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Seamless Image Edit Agent API",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "servers": [{ "url": agent_api_url(port) }],
+        "paths": {
+            "/health": { "get": { "summary": "Check API status" } },
+            "/status": { "get": { "summary": "Check active job status" } },
+            "/process": { "post": { "summary": "Create seamless image outputs" } },
+            "/generate": { "post": { "summary": "Alias for /process" } },
+            "/cancel": { "post": { "summary": "Cancel the active batch before the next image" } }
+        }
+    })
+}
+
+fn parse_agent_job_request(body: &[u8]) -> Result<AgentJobRequest, String> {
+    if body.is_empty() {
+        return Ok(AgentJobRequest {
+            paths: None,
+            options: None,
+        });
+    }
+    serde_json::from_slice(body).map_err(|error| format!("Invalid JSON request: {error}"))
+}
+
+fn agent_options_from_request(options: Option<serde_json::Value>) -> Result<SeamlessOptions, String> {
+    let mut merged = serde_json::to_value(default_seamless_options())
+        .map_err(|error| format!("Unable to build default options: {error}"))?;
+    let Some(options) = options else {
+        return serde_json::from_value(merged)
+            .map_err(|error| format!("Unable to read default options: {error}"));
+    };
+    if options.is_null() {
+        return serde_json::from_value(merged)
+            .map_err(|error| format!("Unable to read default options: {error}"));
+    }
+    let overrides = options
+        .as_object()
+        .ok_or_else(|| "Agent options must be a JSON object.".to_string())?;
+    let base = merged
+        .as_object_mut()
+        .ok_or_else(|| "Unable to merge default options.".to_string())?;
+    for (key, value) in overrides {
+        base.insert(key.clone(), value.clone());
+    }
+    serde_json::from_value(merged).map_err(|error| format!("Invalid agent options: {error}"))
+}
+
+fn handle_agent_route(
+    request: HttpRequest,
+    app: &AppHandle,
+    active_jobs: &ActiveJobState,
+    agent_state: &AgentServerState,
+) -> Result<serde_json::Value, String> {
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/health") => Ok(serde_json::json!({
+            "ok": true,
+            "service": "Seamless Image Edit",
+            "version": env!("CARGO_PKG_VERSION"),
+            "url": agent_status_from(agent_state, active_jobs)?.url
+        })),
+        ("GET", "/openapi.json") => Ok(agent_openapi(agent_status_from(agent_state, active_jobs)?.port)),
+        ("GET", "/status") => {
+            serde_json::to_value(agent_status_from(agent_state, active_jobs)?)
+                .map_err(|error| error.to_string())
+        }
+        ("POST", "/process") | ("POST", "/generate") => {
+            let request = parse_agent_job_request(&request.body)?;
+            let options = agent_options_from_request(request.options)?;
+            let paths = resolve_inputs(request.paths.unwrap_or_default(), options.recursive);
+            if paths.is_empty() {
+                return Err("No input images were provided.".to_string());
+            }
+            let job_id = next_job_id();
+            active_jobs.start(job_id.clone())?;
+            let results = process_paths(app.clone(), active_jobs.clone(), job_id.clone(), paths, options)?;
+            Ok(serde_json::json!({ "ok": true, "jobId": job_id, "results": results }))
+        }
+        ("POST", "/cancel") => {
+            active_jobs.request_cancel()?;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        _ => Err(format!(
+            "No agent endpoint for {} {}",
+            request.method, request.path
+        )),
+    }
+}
+
+fn handle_agent_stream(
+    mut stream: TcpStream,
+    app: &AppHandle,
+    active_jobs: &ActiveJobState,
+    agent_state: &AgentServerState,
+) {
+    let result = read_http_request(&mut stream).and_then(|request| {
+        if request.method == "OPTIONS" {
+            return write_empty_response(&mut stream, "204 No Content");
+        }
+        match handle_agent_route(request, app, active_jobs, agent_state) {
+            Ok(payload) => write_json_response(&mut stream, "200 OK", payload),
+            Err(error) => write_json_response(
+                &mut stream,
+                "400 Bad Request",
+                serde_json::json!({ "ok": false, "error": error }),
+            ),
+        }
+    });
+    if let Err(error) = result {
+        let _ = write_json_response(
+            &mut stream,
+            "400 Bad Request",
+            serde_json::json!({ "ok": false, "error": error }),
+        );
+    }
+}
+
+fn run_agent_server(
+    listener: TcpListener,
+    app: AppHandle,
+    active_jobs: ActiveJobState,
+    agent_state: AgentServerState,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = listener.set_nonblocking(true);
+    while !stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => handle_agent_stream(stream, &app, &active_jobs, &agent_state),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(80));
+            }
+            Err(_) => {
+                thread::sleep(Duration::from_millis(150));
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn get_agent_server_status(
+    agent_state: State<'_, AgentServerState>,
+    active_jobs: State<'_, ActiveJobState>,
+) -> Result<AgentServerStatus, String> {
+    agent_status_from(agent_state.inner(), active_jobs.inner())
+}
+
+fn set_agent_server_enabled_inner(
+    app: AppHandle,
+    agent_state: &AgentServerState,
+    active_jobs: &ActiveJobState,
+    enabled: bool,
+    port: Option<u16>,
+) -> Result<AgentServerStatus, String> {
+    let port = validate_agent_api_port(port)?;
+    {
+        let mut control = agent_state
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock agent server state.".to_string())?;
+
+        if control.enabled && (!enabled || control.port() != port) {
+            if let Some(stop) = control.stop.take() {
+                stop.store(true, Ordering::SeqCst);
+            }
+            control.enabled = false;
+        }
+        control.port = port;
+
+        if enabled && !control.enabled {
+            let listener = TcpListener::bind(("127.0.0.1", port))
+                .map_err(|error| format!("Unable to start Agent API: {error}"))?;
+            let stop = Arc::new(AtomicBool::new(false));
+            thread::spawn({
+                let app = app.clone();
+                let active_jobs = active_jobs.clone();
+                let agent_state = agent_state.clone();
+                let stop = stop.clone();
+                move || run_agent_server(listener, app, active_jobs, agent_state, stop)
+            });
+            control.enabled = true;
+            control.stop = Some(stop);
+        }
+    }
+
+    agent_status_from(agent_state, active_jobs)
+}
+
+#[tauri::command]
+fn set_agent_server_enabled(
+    app: AppHandle,
+    agent_state: State<'_, AgentServerState>,
+    active_jobs: State<'_, ActiveJobState>,
+    enabled: bool,
+    port: Option<u16>,
+) -> Result<AgentServerStatus, String> {
+    set_agent_server_enabled_inner(
+        app,
+        agent_state.inner(),
+        active_jobs.inner(),
+        enabled,
+        port,
+    )
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .manage(ActiveJobState::default())
+        .manage(AgentServerState::default())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
@@ -1567,9 +2083,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            cancel_active_job,
+            get_agent_server_status,
             open_containing_folder,
             preview_image_data_url,
             resolve_inputs,
+            set_agent_server_enabled,
             start_seamless_job
         ])
         .run(tauri::generate_context!())
