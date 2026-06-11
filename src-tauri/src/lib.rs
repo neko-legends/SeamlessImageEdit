@@ -58,6 +58,8 @@ struct SeamlessOptions {
     strategy: String,
     #[serde(default)]
     flatten: f32,
+    #[serde(default)]
+    snap_period: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +83,7 @@ pub fn run_headless_cli(args: Vec<String>) -> Result<(), String> {
         blend_percent: default_blend_percent(),
         strategy: default_strategy(),
         flatten: 0.0,
+        snap_period: false,
     };
     let mut input_paths: Vec<String> = Vec::new();
     let mut index = 1;
@@ -145,6 +148,9 @@ pub fn run_headless_cli(args: Vec<String>) -> Result<(), String> {
             }
             "--overwrite" => {
                 options.overwrite = true;
+            }
+            "--snap-period" => {
+                options.snap_period = true;
             }
             "--blend" => {
                 index += 1;
@@ -211,7 +217,8 @@ fn print_headless_help() {
            --suffix <suffix>                 Output filename suffix, default _seamless\n\
            --recursive                       Recurse through input folders\n\
            --overwrite                       Replace existing outputs\n\
-           --blend <percent>                 Seam band, default 20"
+           --blend <percent>                 Seam band, default 20\n\
+           --snap-period                     Crop to the detected pattern period before cutting"
     );
 }
 
@@ -791,6 +798,109 @@ fn make_seamless(source: &RgbaImage, mode: &str, blend_percent: f32) -> RgbaImag
     output
 }
 
+fn horizontal_shift_score(source: &RgbaImage, lag: u32) -> f32 {
+    let width = source.width();
+    let height = source.height();
+    if lag == 0 || lag >= width || height == 0 {
+        return f32::INFINITY;
+    }
+
+    let span = width - lag;
+    let x_step = (span / 96).max(1);
+    let y_step = (height / 128).max(1);
+    let mut total = 0.0f32;
+    let mut count = 0u32;
+    let mut y = 0;
+    while y < height {
+        let mut x = 0;
+        while x < span {
+            let head = *source.get_pixel(x, y);
+            let shifted = *source.get_pixel(x + lag, y);
+            for channel in 0..3 {
+                total += (head.0[channel] as f32 - shifted.0[channel] as f32).abs();
+            }
+            count += 3;
+            x += x_step;
+        }
+        y += y_step;
+    }
+
+    if count == 0 {
+        f32::INFINITY
+    } else {
+        total / count as f32
+    }
+}
+
+fn detect_periodic_crop_width(source: &RgbaImage) -> Option<u32> {
+    let width = source.width();
+    if width < 16 {
+        return None;
+    }
+
+    let max_lag = width / 2;
+    if max_lag < 4 {
+        return None;
+    }
+
+    let scores = (4..=max_lag)
+        .map(|lag| (lag, horizontal_shift_score(source, lag)))
+        .collect::<Vec<_>>();
+    let best_score = scores
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(f32::INFINITY, f32::min);
+    // The repeat must match closely in absolute terms or the image is not periodic.
+    if !best_score.is_finite() || best_score > 26.0 {
+        return None;
+    }
+
+    // Fundamental period = smallest lag whose score is close to the global best.
+    let tolerance = best_score.mul_add(0.25, 2.0);
+    let period = scores
+        .iter()
+        .find(|(_, score)| *score <= best_score + tolerance)
+        .map(|(lag, _)| *lag)?;
+
+    // A true repeating pattern scores much worse half a period out of phase;
+    // smooth gradients score low at every small lag and must not snap.
+    let anti_lag = (period + (period / 2).max(1)).min(width - 1);
+    let anti_score = horizontal_shift_score(source, anti_lag);
+    if anti_score < 4.0 * (best_score + 1.0) {
+        return None;
+    }
+
+    let crop = (width / period) * period;
+    if crop == width || crop < 8 {
+        None
+    } else {
+        Some(crop)
+    }
+}
+
+fn snap_periodic_crop(source: &RgbaImage, mode: &str) -> RgbaImage {
+    let snap_x = matches!(mode, "horizontal" | "tile");
+    let snap_y = matches!(mode, "vertical" | "tile");
+    let crop_width = if snap_x {
+        detect_periodic_crop_width(source)
+    } else {
+        None
+    };
+    let crop_height = if snap_y {
+        detect_periodic_crop_width(&transpose_image(source))
+    } else {
+        None
+    };
+
+    let width = crop_width.unwrap_or(source.width());
+    let height = crop_height.unwrap_or(source.height());
+    if width == source.width() && height == source.height() {
+        return source.clone();
+    }
+
+    image::imageops::crop_imm(source, 0, 0, width, height).to_image()
+}
+
 fn transpose_image(source: &RgbaImage) -> RgbaImage {
     let mut output = RgbaImage::new(source.height(), source.width());
     for y in 0..source.height() {
@@ -1147,6 +1257,11 @@ fn process_one(path: &Path, options: &SeamlessOptions) -> Result<PathBuf, String
         return Err("Image must be at least 2x2 pixels.".to_string());
     }
 
+    let image = if options.snap_period {
+        snap_periodic_crop(&image, mode)
+    } else {
+        image
+    };
     let prepared = flatten_low_frequency(&image, options.flatten);
     let seamless = match strategy {
         "seam-cut" => make_seam_cut_seamless(&prepared, mode, options.blend_percent),
@@ -1598,6 +1713,83 @@ mod tests {
             assert_horizontal_edges_exact(&tile);
             assert_vertical_edges_exact(&tile);
         }
+    }
+
+    fn brick_pattern(width: u32, height: u32, brick_w: u32, brick_h: u32) -> RgbaImage {
+        let mut image = RgbaImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let row = y / brick_h;
+                let course_offset = if row % 2 == 0 { 0 } else { brick_w / 2 };
+                let local_x = (x + course_offset) % brick_w;
+                let local_y = y % brick_h;
+                let mortar = local_x < 2 || local_y < 2;
+                let color = if mortar {
+                    Rgba([180, 176, 168, 255])
+                } else {
+                    Rgba([150, 62, 48, 255])
+                };
+                image.put_pixel(x, y, color);
+            }
+        }
+        image
+    }
+
+    #[test]
+    fn snap_period_crops_bricks_to_whole_pattern_repeats() {
+        // 25 px bricks, 16 px courses: the pattern repeats every 25x32 px,
+        // so a 132x100 image should snap down to 125x96.
+        let source = brick_pattern(132, 100, 25, 16);
+        let crop = detect_periodic_crop_width(&source).expect("period detected");
+        assert_eq!(crop % 25, 0, "crop width {crop} is not a brick multiple");
+
+        let cropped = snap_periodic_crop(&source, "tile");
+        assert_eq!(cropped.width() % 25, 0);
+        assert_eq!(cropped.height() % 32, 0, "height should snap to course pair");
+        // The cropped image must already wrap perfectly before any seam work.
+        for y in 0..cropped.height() {
+            assert_eq!(
+                *cropped.get_pixel(0, y),
+                *source.get_pixel(cropped.width(), y)
+            );
+        }
+        for x in 0..cropped.width() {
+            assert_eq!(
+                *cropped.get_pixel(x, 0),
+                *source.get_pixel(x, cropped.height())
+            );
+        }
+    }
+
+    #[test]
+    fn snap_period_skips_images_already_sized_to_the_pattern() {
+        // 128 is an exact multiple of the 32 px checker period: nothing to fix.
+        let source = brick_pattern(128, 96, 32, 16);
+        let unchanged = snap_periodic_crop(&source, "tile");
+        assert_eq!(unchanged.dimensions(), source.dimensions());
+    }
+
+    #[test]
+    fn snap_period_leaves_non_periodic_images_untouched() {
+        let noise = noise_fixture(128, 96);
+        assert_eq!(detect_periodic_crop_width(&noise), None);
+        let unchanged = snap_periodic_crop(&noise, "tile");
+        assert_eq!(unchanged.dimensions(), noise.dimensions());
+
+        let vignette = illumination_gradient(160, 96);
+        assert_eq!(detect_periodic_crop_width(&vignette), None);
+    }
+
+    #[test]
+    fn snap_period_respects_mode_axes() {
+        let source = brick_pattern(132, 100, 25, 16);
+        let horizontal = snap_periodic_crop(&source, "horizontal");
+        assert_eq!(horizontal.height(), source.height());
+        assert!(horizontal.width() < source.width());
+
+        let vertical = snap_periodic_crop(&source, "vertical");
+        assert_eq!(vertical.width(), source.width());
+        assert!(vertical.height() < source.height());
     }
 
     #[test]

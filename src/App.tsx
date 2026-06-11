@@ -36,6 +36,7 @@ type SeamlessOptions = {
   blendPercent: number
   strategy: SeamStrategy
   flatten: number
+  snapPeriod: boolean
 }
 
 type QueueItem = {
@@ -99,6 +100,7 @@ const defaultOptions: SeamlessOptions = {
   blendPercent: 18,
   strategy: 'seam-cut',
   flatten: 0,
+  snapPeriod: false,
 }
 
 const modeOptions: Array<{ id: SeamMode; label: string; icon: typeof ArrowLeftRight }> = [
@@ -175,6 +177,7 @@ function loadOptions(): SeamlessOptions {
       blendPercent: coerceNumber(parsed.blendPercent, defaultOptions.blendPercent, 4, 45),
       strategy: coerceStrategy(parsed.strategy),
       flatten: coerceNumber(parsed.flatten, defaultOptions.flatten, 0, 1),
+      snapPeriod: coerceBoolean(parsed.snapPeriod, defaultOptions.snapPeriod),
     }
   } catch {
     return defaultOptions
@@ -789,6 +792,14 @@ function App() {
               value={options.flatten}
               valueText={formatRangeValue(options.flatten, defaultOptions.flatten, 0, 1, 1)}
             />
+            <label className="toggle-row" title="Detect repeating patterns (bricks, tiles) and crop to a whole number of repeats so no partial bricks appear when tiling">
+              <input
+                type="checkbox"
+                checked={options.snapPeriod}
+                onChange={(event) => setOptions((current) => ({ ...current, snapPeriod: event.currentTarget.checked }))}
+              />
+              <span>Snap to pattern repeat</span>
+            </label>
             <label className="toggle-row">
               <input
                 type="checkbox"
