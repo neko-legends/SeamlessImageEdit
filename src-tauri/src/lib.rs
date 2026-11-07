@@ -394,7 +394,8 @@ pub fn run_headless_cli(args: Vec<String>) -> Result<(), String> {
 fn print_headless_help() {
     println!(
         "SeamlessImageEdit headless usage:\n\
-         seamless-image-edit --headless [options] <image-or-folder>...\n\n\
+         seamless-image-edit --headless [options] <image-or-folder>...\n\
+         seamless-image-edit --headless --agent-api-port <port>   Serve the Agent API without a window\n\n\
          Options:\n\
            --mode horizontal|vertical|tile   Seam direction, default tile\n\
            --strategy seam-cut|synthesis|blend Strategy, default seam-cut\n\
@@ -617,8 +618,25 @@ fn read_webp_rgba_fallback(path: &Path) -> Result<RgbaImage, String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn read_webp_rgba_fallback(_path: &Path) -> Result<RgbaImage, String> {
-    Err("no platform WebP fallback is available".to_string())
+fn read_webp_rgba_fallback(path: &Path) -> Result<RgbaImage, String> {
+    let bytes = fs::read(path).map_err(|error| format!("Unable to read WebP: {error}"))?;
+    let decoded = webp::Decoder::new(&bytes)
+        .decode()
+        .ok_or_else(|| "libwebp could not decode the file.".to_string())?;
+    let (width, height) = (decoded.width(), decoded.height());
+    if width == 0 || height == 0 {
+        return Err("libwebp decoded an empty WebP.".to_string());
+    }
+    let pixels: Vec<u8> = if decoded.is_alpha() {
+        decoded.to_vec()
+    } else {
+        decoded
+            .chunks_exact(3)
+            .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
+            .collect()
+    };
+    RgbaImage::from_raw(width, height, pixels)
+        .ok_or_else(|| "libwebp returned an invalid pixel buffer.".to_string())
 }
 
 fn sanitized_suffix(value: &str) -> String {
@@ -2195,16 +2213,50 @@ fn set_agent_server_enabled(
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    run_app(None)
+}
+
+/// Starts the app with its window hidden and the Agent API already listening on
+/// `port` (`--headless --agent-api-port <port>`, as Neko Legends Control Center
+/// launches headless apps). Runs until the process is terminated.
+pub fn run_headless_agent_api(port: u16) {
+    run_app(Some(port))
+}
+
+fn run_app(headless_agent_port: Option<u16>) {
+    let mut context = tauri::generate_context!();
+    let mut builder = tauri::Builder::default()
         .manage(ActiveJobState::default())
-        .manage(AgentServerState::default())
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .manage(AgentServerState::default());
+    if headless_agent_port.is_some() {
+        for window in context.config_mut().app.windows.iter_mut() {
+            window.visible = false;
+        }
+    } else {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
             }
-        }))
+        }));
+    }
+    builder
+        .setup(move |app| {
+            if let Some(port) = headless_agent_port {
+                let agent_state = app.state::<AgentServerState>().inner().clone();
+                let active_jobs = app.state::<ActiveJobState>().inner().clone();
+                let status = set_agent_server_enabled_inner(
+                    app.handle().clone(),
+                    &agent_state,
+                    &active_jobs,
+                    true,
+                    Some(port),
+                )?;
+                println!("Agent API listening on {}", status.url);
+            }
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -2216,13 +2268,34 @@ pub fn run() {
             set_agent_server_enabled,
             start_seamless_job
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running Tauri application");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn libwebp_fallback_decodes_lossy_and_lossless_webp() {
+        let source = gradient(24, 16);
+        let dir = env::temp_dir().join(format!("seamless-webp-fallback-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        for (name, quality) in [("lossy.webp", 80.0), ("lossless.webp", 100.0)] {
+            let encoder = webp::Encoder::from_rgba(source.as_raw(), 24, 16);
+            let bytes = if quality >= 100.0 {
+                encoder.encode_lossless()
+            } else {
+                encoder.encode(quality)
+            };
+            let path = dir.join(name);
+            fs::write(&path, &*bytes).expect("write webp");
+            let decoded = read_webp_rgba_fallback(&path).expect("libwebp decode");
+            assert_eq!(decoded.dimensions(), (24, 16));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn gradient(width: u32, height: u32) -> RgbaImage {
         let mut image = RgbaImage::new(width, height);
