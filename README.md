@@ -42,10 +42,20 @@ Test fixtures are written to `src-tauri\target\visual-seam-test` during `cargo t
 
 ## Development
 
+The source is intended to build on Windows, macOS, and Linux through Tauri. Install Node.js, Rust, and the Tauri prerequisites for your operating system, then run:
+
 ```powershell
 npm install
 npm run dev
 ```
+
+## Release Downloads
+
+Each release includes a Windows x64 portable executable, a Windows installer and a Linux AppImage. macOS users can build from source.
+
+### Linux / Omarchy
+
+Each GitHub release includes a Linux AppImage (`Seamless.Image.Edit_<version>_amd64.AppImage`) next to the Windows builds. Make it executable (`chmod +x`) and run it, or let [Neko Legends Control Center](https://github.com/neko-legends/neko-legends-control-center) install, update and launch it for you. Tested on Omarchy (Arch Linux + Hyprland, Wayland, NVIDIA). The optional AI inpainting worker is set up with [`uv`](https://docs.astral.sh/uv/), which Omarchy already includes.
 
 ## Headless CLI
 

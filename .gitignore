@@ -5,5 +5,13 @@ src-tauri/target/
 src-tauri/gen/
 *.log
 *.tmp
+*.exe
+*.msi
+*.dmg
+*.zip
+*.7z
+*.tar.gz
+__pycache__/
+*.py[cod]
 .DS_Store
 Thumbs.db

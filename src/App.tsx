@@ -22,7 +22,7 @@ import {
 import { type KeyboardEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 type SeamMode = 'horizontal' | 'vertical' | 'tile'
-type SeamStrategy = 'seam-cut' | 'synthesis' | 'blend'
+type SeamStrategy = 'seam-cut' | 'synthesis' | 'blend' | 'inference'
 type OutputFormat = 'webp' | 'png'
 type QueueStatus = 'pending' | 'running' | 'done' | 'error'
 
@@ -38,6 +38,13 @@ type SeamlessOptions = {
   strategy: SeamStrategy
   flatten: number
   snapPeriod: boolean
+  inferenceModel: string
+  inferencePrompt: string
+  inferenceNegativePrompt: string
+  inferenceDenoise: number
+  inferenceGuidance: number
+  inferenceSteps: number
+  inferenceSeed: number
 }
 
 type QueueItem = {
@@ -55,7 +62,7 @@ type ProcessResult = {
 }
 
 type WorkerEvent = {
-  type: 'image_start' | 'image_done' | 'image_error' | 'done' | 'canceled'
+  type: 'image_start' | 'image_done' | 'image_error' | 'setup' | 'error' | 'done' | 'canceled'
   path?: string
   output?: string
   message?: string
@@ -125,6 +132,13 @@ const defaultOptions: SeamlessOptions = {
   strategy: 'seam-cut',
   flatten: 0,
   snapPeriod: false,
+  inferenceModel: 'diffusers/stable-diffusion-xl-1.0-inpainting-0.1',
+  inferencePrompt: 'tileable material texture, same surface, same colors, same scale, natural continuous seam repair',
+  inferenceNegativePrompt: 'new objects, text, watermark, logo, frame, border, blurry, smeared, distorted geometry',
+  inferenceDenoise: 0.35,
+  inferenceGuidance: 5,
+  inferenceSteps: 18,
+  inferenceSeed: 0,
 }
 
 const modeOptions: Array<{ id: SeamMode; label: string; icon: typeof ArrowLeftRight }> = [
@@ -148,6 +162,11 @@ const strategyOptions: Array<{ id: SeamStrategy; label: string; title: string }>
     id: 'blend',
     label: 'Blend',
     title: 'Fast soft crossfade for blurry, low-detail, or almost-seamless images. Weak for bricks, stripes, text, or visible geometry.',
+  },
+  {
+    id: 'inference',
+    label: 'Tile inpaint',
+    title: 'Tile-aware AI seam repair for supplied textures. Only the seam band is composited back into the image.',
   },
 ]
 
@@ -180,7 +199,7 @@ function coerceFormat(value: unknown): OutputFormat {
 }
 
 function coerceStrategy(value: unknown): SeamStrategy {
-  return value === 'synthesis' || value === 'blend' || value === 'seam-cut' ? value : defaultOptions.strategy
+  return value === 'synthesis' || value === 'blend' || value === 'seam-cut' || value === 'inference' ? value : defaultOptions.strategy
 }
 
 function coerceBoolean(value: unknown, fallback: boolean): boolean {
@@ -220,6 +239,14 @@ function loadOptions(): SeamlessOptions {
       strategy: coerceStrategy(parsed.strategy),
       flatten: coerceNumber(parsed.flatten, defaultOptions.flatten, 0, 1),
       snapPeriod: coerceBoolean(parsed.snapPeriod, defaultOptions.snapPeriod),
+      inferenceModel: typeof parsed.inferenceModel === 'string' && parsed.inferenceModel.trim() ? parsed.inferenceModel : defaultOptions.inferenceModel,
+      inferencePrompt: typeof parsed.inferencePrompt === 'string' ? parsed.inferencePrompt : defaultOptions.inferencePrompt,
+      inferenceNegativePrompt:
+        typeof parsed.inferenceNegativePrompt === 'string' ? parsed.inferenceNegativePrompt : defaultOptions.inferenceNegativePrompt,
+      inferenceDenoise: coerceNumber(parsed.inferenceDenoise, defaultOptions.inferenceDenoise, 0.05, 0.95),
+      inferenceGuidance: coerceNumber(parsed.inferenceGuidance, defaultOptions.inferenceGuidance, 1, 15),
+      inferenceSteps: coerceNumber(parsed.inferenceSteps, defaultOptions.inferenceSteps, 4, 80),
+      inferenceSeed: Math.round(coerceNumber(parsed.inferenceSeed, defaultOptions.inferenceSeed, 0, 4294967295)),
     }
   } catch {
     return defaultOptions
@@ -635,6 +662,14 @@ function App() {
         patchQueueItem(payload.path, { status: 'error', message: payload.message ?? 'Failed' })
         pushLog(`${fileName(payload.path)} failed: ${payload.message ?? 'Unknown error'}`)
       }
+      if (payload.type === 'setup' && payload.message) {
+        setNotice(payload.message)
+        pushLog(payload.message)
+      }
+      if (payload.type === 'error' && payload.message) {
+        setNotice(payload.message)
+        pushLog(payload.message)
+      }
       if (payload.type === 'canceled') {
         setQueue((current) =>
           current.map((item) => (item.status === 'pending' || item.status === 'running' ? { ...item, status: 'error', message: 'Canceled' } : item)),
@@ -853,7 +888,7 @@ function App() {
       </header>
 
       <main className="workspace">
-        <aside className="tool-panel">
+        <aside className={classNames('tool-panel', options.strategy === 'inference' && 'scrollable')}>
           <section className="panel-section">
             <div className="section-title">
               <Sparkles size={16} />
@@ -989,6 +1024,83 @@ function App() {
               value={options.flatten}
               valueText={formatRangeValue(options.flatten, defaultOptions.flatten, 0, 1, 1)}
             />
+            {options.strategy === 'inference' ? (
+              <div className="inference-fields">
+                <label className="field">
+                  <span>Inpaint model</span>
+                  <input
+                    value={options.inferenceModel}
+                    onChange={(event) => setOptions((current) => ({ ...current, inferenceModel: event.currentTarget.value }))}
+                  />
+                </label>
+                <label className="field">
+                  <span>Repair prompt</span>
+                  <textarea
+                    rows={3}
+                    value={options.inferencePrompt}
+                    onChange={(event) => setOptions((current) => ({ ...current, inferencePrompt: event.currentTarget.value }))}
+                  />
+                </label>
+                <label className="field">
+                  <span>Avoid</span>
+                  <textarea
+                    rows={2}
+                    value={options.inferenceNegativePrompt}
+                    onChange={(event) => setOptions((current) => ({ ...current, inferenceNegativePrompt: event.currentTarget.value }))}
+                  />
+                </label>
+                <RangeControl
+                  label="Denoise"
+                  max={0.95}
+                  min={0.05}
+                  onChange={(value) => setOptions((current) => ({ ...current, inferenceDenoise: value }))}
+                  step={0.05}
+                  title="How strongly inference may repaint the seam band. Lower preserves more of the original texture."
+                  value={options.inferenceDenoise}
+                  valueText={formatRangeValue(options.inferenceDenoise, defaultOptions.inferenceDenoise, 0.05, 0.95, 2)}
+                />
+                <RangeControl
+                  label="Guidance"
+                  max={15}
+                  min={1}
+                  onChange={(value) => setOptions((current) => ({ ...current, inferenceGuidance: value }))}
+                  step={0.5}
+                  value={options.inferenceGuidance}
+                  valueText={formatRangeValue(options.inferenceGuidance, defaultOptions.inferenceGuidance, 1, 15, 1)}
+                />
+                <div className="number-grid">
+                  <label className="field">
+                    <span>Steps</span>
+                    <input
+                      type="number"
+                      min="4"
+                      max="80"
+                      value={options.inferenceSteps}
+                      onChange={(event) =>
+                        setOptions((current) => ({
+                          ...current,
+                          inferenceSteps: Math.max(4, Math.min(80, Number(event.currentTarget.value) || defaultOptions.inferenceSteps)),
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Seed</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={options.inferenceSeed}
+                      onChange={(event) =>
+                        setOptions((current) => ({
+                          ...current,
+                          inferenceSeed: Math.max(0, Math.round(Number(event.currentTarget.value) || 0)),
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+              </div>
+            ) : null}
             <ToggleControl
               checked={options.snapPeriod}
               label="Snap to pattern repeat"

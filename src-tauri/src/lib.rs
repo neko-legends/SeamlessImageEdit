@@ -2,11 +2,11 @@ use base64::{engine::general_purpose, Engine as _};
 use image::{imageops::FilterType, ImageEncoder, ImageFormat, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::{
-    env,
-    fs,
+    env, fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -18,15 +18,28 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use texture_synthesis as texsynth;
 
+mod neko_store;
+use neko_store::NekoStore;
+
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "jpe", "jfif", "webp", "bmp", "tif", "tiff",
 ];
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+const EMBEDDED_INFERENCE_WORKER: &str = include_str!("../../python/seamless_inference_worker.py");
+const EMBEDDED_NEKO_STORE_HELPER: &str = include_str!("../../python/neko_store.py");
 const SEAM_FEATHER: i32 = 3;
 const DEFAULT_AGENT_API_PORT: u16 = 17335;
 const AGENT_APP_ID: &str = "seamless-image-edit";
 const AGENT_APP_NAME: &str = "Seamless Image Edit";
 const AGENT_API_BIND_ADDRESS: &str = "127.0.0.1";
 const AGENT_API_REGISTRY_FILE: &str = "agent-api-registry.json";
+const DEFAULT_WINDOW_WIDTH: u32 = 1280;
+const DEFAULT_WINDOW_HEIGHT: u32 = 820;
+const MIN_WINDOW_WIDTH: u32 = 860;
+const MIN_WINDOW_HEIGHT: u32 = 540;
+const LANDSCAPE_WINDOW_WIDTH_RATIO: f64 = 0.5;
+const PORTRAIT_WINDOW_WIDTH_RATIO: f64 = 0.9;
 
 fn default_mode() -> String {
     "tile".to_string()
@@ -46,6 +59,31 @@ fn default_blend_percent() -> f32 {
 
 fn default_strategy() -> String {
     "seam-cut".to_string()
+}
+
+fn default_inference_model() -> String {
+    "diffusers/stable-diffusion-xl-1.0-inpainting-0.1".to_string()
+}
+
+fn default_inference_prompt() -> String {
+    "tileable material texture, same surface, same colors, same scale, natural continuous seam repair".to_string()
+}
+
+fn default_inference_negative_prompt() -> String {
+    "new objects, text, watermark, logo, frame, border, blurry, smeared, distorted geometry"
+        .to_string()
+}
+
+fn default_inference_denoise() -> f32 {
+    0.35
+}
+
+fn default_inference_guidance() -> f32 {
+    5.0
+}
+
+fn default_inference_steps() -> u32 {
+    18
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -73,6 +111,20 @@ struct SeamlessOptions {
     flatten: f32,
     #[serde(default)]
     snap_period: bool,
+    #[serde(default = "default_inference_model")]
+    inference_model: String,
+    #[serde(default = "default_inference_prompt")]
+    inference_prompt: String,
+    #[serde(default = "default_inference_negative_prompt")]
+    inference_negative_prompt: String,
+    #[serde(default = "default_inference_denoise")]
+    inference_denoise: f32,
+    #[serde(default = "default_inference_guidance")]
+    inference_guidance: f32,
+    #[serde(default = "default_inference_steps")]
+    inference_steps: u32,
+    #[serde(default)]
+    inference_seed: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,6 +139,17 @@ struct ProcessResult {
 struct ProcessedOutput {
     output_path: PathBuf,
     message: String,
+}
+
+// The Python worker reads these top-level keys in snake_case (options stay
+// camelCase via SeamlessOptions).
+#[derive(Debug, Serialize)]
+struct InferenceWorkerJob {
+    input_path: String,
+    output_path: String,
+    env_dir: String,
+    model_dir: String,
+    options: SeamlessOptions,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +311,13 @@ fn default_seamless_options() -> SeamlessOptions {
         strategy: default_strategy(),
         flatten: 0.0,
         snap_period: false,
+        inference_model: default_inference_model(),
+        inference_prompt: default_inference_prompt(),
+        inference_negative_prompt: default_inference_negative_prompt(),
+        inference_denoise: default_inference_denoise(),
+        inference_guidance: default_inference_guidance(),
+        inference_steps: default_inference_steps(),
+        inference_seed: 0,
     }
 }
 
@@ -272,6 +342,13 @@ pub fn run_headless_cli(args: Vec<String>) -> Result<(), String> {
         strategy: default_strategy(),
         flatten: 0.0,
         snap_period: false,
+        inference_model: default_inference_model(),
+        inference_prompt: default_inference_prompt(),
+        inference_negative_prompt: default_inference_negative_prompt(),
+        inference_denoise: default_inference_denoise(),
+        inference_guidance: default_inference_guidance(),
+        inference_steps: default_inference_steps(),
+        inference_seed: 0,
     };
     let mut input_paths: Vec<String> = Vec::new();
     let mut index = 1;
@@ -301,8 +378,60 @@ pub fn run_headless_cli(args: Vec<String>) -> Result<(), String> {
                 index += 1;
                 options.strategy = args
                     .get(index)
-                    .ok_or_else(|| "--strategy requires seam-cut, synthesis, or blend".to_string())?
+                    .ok_or_else(|| {
+                        "--strategy requires seam-cut, synthesis, blend, or inference".to_string()
+                    })?
                     .clone();
+            }
+            "--inference-model" => {
+                index += 1;
+                options.inference_model = args
+                    .get(index)
+                    .ok_or_else(|| {
+                        "--inference-model requires a Hugging Face model id".to_string()
+                    })?
+                    .clone();
+            }
+            "--inference-prompt" => {
+                index += 1;
+                options.inference_prompt = args
+                    .get(index)
+                    .ok_or_else(|| "--inference-prompt requires text".to_string())?
+                    .clone();
+            }
+            "--inference-negative" => {
+                index += 1;
+                options.inference_negative_prompt = args
+                    .get(index)
+                    .ok_or_else(|| "--inference-negative requires text".to_string())?
+                    .clone();
+            }
+            "--inference-denoise" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    "--inference-denoise requires a value from 0 to 1".to_string()
+                })?;
+                options.inference_denoise = value.parse::<f32>().map_err(|error| {
+                    format!("Invalid --inference-denoise value '{value}': {error}")
+                })?;
+            }
+            "--inference-steps" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--inference-steps requires a number".to_string())?;
+                options.inference_steps = value.parse::<u32>().map_err(|error| {
+                    format!("Invalid --inference-steps value '{value}': {error}")
+                })?;
+            }
+            "--inference-seed" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--inference-seed requires a number".to_string())?;
+                options.inference_seed = value.parse::<u64>().map_err(|error| {
+                    format!("Invalid --inference-seed value '{value}': {error}")
+                })?;
             }
             "--flatten" => {
                 index += 1;
@@ -398,7 +527,7 @@ fn print_headless_help() {
          seamless-image-edit --headless --agent-api-port <port>   Serve the Agent API without a window\n\n\
          Options:\n\
            --mode horizontal|vertical|tile   Seam direction, default tile\n\
-           --strategy seam-cut|synthesis|blend Strategy, default seam-cut\n\
+           --strategy seam-cut|synthesis|blend|inference Strategy, default seam-cut\n\
            --flatten <0..1>                  Illumination flattening, default 0\n\
            --format webp|png                 Output format, default webp\n\
            --output-dir <folder>             Output folder\n\
@@ -407,7 +536,13 @@ fn print_headless_help() {
            --recursive                       Recurse through input folders\n\
            --overwrite                       Replace existing outputs\n\
            --blend <percent>                 Seam band, default 20\n\
-           --snap-period                     Crop to the detected pattern period before cutting"
+           --snap-period                     Crop to the detected pattern period before cutting\n\
+           --inference-model <model>          Hugging Face inpaint model for inference strategy\n\
+           --inference-prompt <text>          Prompt for inference strategy\n\
+           --inference-negative <text>        Negative prompt for inference strategy\n\
+           --inference-denoise <0..1>         Inference repair strength, default 0.35\n\
+           --inference-steps <count>          Inference steps, default 18\n\
+           --inference-seed <seed>            Fixed seed, default 0=random"
     );
 }
 
@@ -513,9 +648,11 @@ fn rgba_png_data_url(image: &RgbaImage) -> Result<String, String> {
 fn read_image_rgba(path: &Path) -> Result<RgbaImage, String> {
     match image::open(path) {
         Ok(image) => Ok(image.to_rgba8()),
-        Err(error) if is_webp_file(path) => read_webp_rgba_fallback(path).map_err(|fallback_error| {
-            format!("Unable to read image: {error}; WebP fallback failed: {fallback_error}")
-        }),
+        Err(error) if is_webp_file(path) => {
+            read_webp_rgba_fallback(path).map_err(|fallback_error| {
+                format!("Unable to read image: {error}; WebP fallback failed: {fallback_error}")
+            })
+        }
         Err(error) => Err(format!("Unable to read image: {error}")),
     }
 }
@@ -557,8 +694,9 @@ fn read_webp_rgba_fallback(path: &Path) -> Result<RgbaImage, String> {
 
         let result = (|| {
             let factory: IWICImagingFactory =
-                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
-                    .map_err(|error| format!("Unable to create Windows imaging factory: {error}"))?;
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).map_err(
+                    |error| format!("Unable to create Windows imaging factory: {error}"),
+                )?;
             let decoder = factory
                 .CreateDecoderFromFilename(
                     PCWSTR::from_raw(wide_path.as_ptr()),
@@ -567,12 +705,12 @@ fn read_webp_rgba_fallback(path: &Path) -> Result<RgbaImage, String> {
                     WICDecodeMetadataCacheOnLoad,
                 )
                 .map_err(|error| format!("Windows imaging could not open WebP: {error}"))?;
-            let frame = decoder
-                .GetFrame(0)
-                .map_err(|error| format!("Windows imaging could not read first WebP frame: {error}"))?;
-            let converter = factory
-                .CreateFormatConverter()
-                .map_err(|error| format!("Windows imaging could not create format converter: {error}"))?;
+            let frame = decoder.GetFrame(0).map_err(|error| {
+                format!("Windows imaging could not read first WebP frame: {error}")
+            })?;
+            let converter = factory.CreateFormatConverter().map_err(|error| {
+                format!("Windows imaging could not create format converter: {error}")
+            })?;
             converter
                 .Initialize(
                     &frame,
@@ -582,7 +720,9 @@ fn read_webp_rgba_fallback(path: &Path) -> Result<RgbaImage, String> {
                     0.0,
                     WICBitmapPaletteTypeCustom,
                 )
-                .map_err(|error| format!("Windows imaging could not convert WebP to RGBA: {error}"))?;
+                .map_err(|error| {
+                    format!("Windows imaging could not convert WebP to RGBA: {error}")
+                })?;
 
             let mut width = 0;
             let mut height = 0;
@@ -682,6 +822,7 @@ fn normalized_strategy(value: &str) -> Result<&'static str, String> {
         "seam-cut" | "seam_cut" | "seamcut" => Ok("seam-cut"),
         "synthesis" | "content-aware" | "content_aware" => Ok("synthesis"),
         "blend" | "crossfade" => Ok("blend"),
+        "inference" | "ai" | "ai-repair" | "ai_repair" => Ok("inference"),
         other => Err(format!("Unsupported seamless strategy: {other}")),
     }
 }
@@ -1008,6 +1149,194 @@ fn make_seamless(source: &RgbaImage, mode: &str, blend_percent: f32) -> RgbaImag
 struct AxisSnap {
     period: u32,
     crop: u32,
+}
+
+/// App identifier used for the shared NekoLegendsAI store.
+const NEKO_APP_SLUG: &str = "seamlessimageedit";
+
+fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Unable to resolve app data dir: {error}"))?;
+    fs::create_dir_all(&dir).map_err(|error| format!("Unable to create app data dir: {error}"))?;
+    Ok(dir)
+}
+
+fn neko_store(app: &AppHandle) -> Result<NekoStore, String> {
+    let app_data = app_data_dir(app)?;
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    Ok(NekoStore::resolve_with_volume_hint(
+        NEKO_APP_SLUG,
+        &app_data,
+        exe_dir.as_deref(),
+    ))
+}
+
+fn resolve_env_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data = app_data_dir(app)?;
+    let legacy = app_data.join("python-env");
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    Ok(neko_store(app)?.env_dir)
+}
+
+fn resolve_models_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data = app_data_dir(app)?;
+    let legacy = app_data.join("models");
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    Ok(neko_store(app)?.models_dir)
+}
+
+fn apply_store_env(app: &AppHandle, command: &mut Command) {
+    if let Ok(store) = neko_store(app) {
+        store.apply_env(command);
+    }
+}
+
+fn inference_worker_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let resource_dir = app.path().resource_dir().ok();
+    let candidates = [
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("python")
+            .join("seamless_inference_worker.py"),
+        exe_dir
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("python")
+            .join("seamless_inference_worker.py"),
+        resource_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("_up_")
+            .join("python")
+            .join("seamless_inference_worker.py"),
+        resource_dir
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("python")
+            .join("seamless_inference_worker.py"),
+    ];
+
+    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
+        return Ok(path);
+    }
+
+    let worker_dir = app_data_dir(app)?.join("python");
+    fs::create_dir_all(&worker_dir)
+        .map_err(|error| format!("Unable to create inference worker dir: {error}"))?;
+    let worker = worker_dir.join("seamless_inference_worker.py");
+    let needs_write = fs::read_to_string(&worker)
+        .map(|content| content != EMBEDDED_INFERENCE_WORKER)
+        .unwrap_or(true);
+    if needs_write {
+        fs::write(&worker, EMBEDDED_INFERENCE_WORKER)
+            .map_err(|error| format!("Unable to write inference worker: {error}"))?;
+    }
+    let helper = worker_dir.join("neko_store.py");
+    let helper_needs_write = fs::read_to_string(&helper)
+        .map(|content| content != EMBEDDED_NEKO_STORE_HELPER)
+        .unwrap_or(true);
+    if helper_needs_write {
+        fs::write(&helper, EMBEDDED_NEKO_STORE_HELPER)
+            .map_err(|error| format!("Unable to write inference helper: {error}"))?;
+    }
+    Ok(worker)
+}
+
+fn parse_python_version(output: &str) -> Option<(u32, u32, u32)> {
+    let version = output
+        .split_whitespace()
+        .find(|part| part.chars().next().is_some_and(|ch| ch.is_ascii_digit()))?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn supported_python_version(version: (u32, u32, u32)) -> bool {
+    version.0 == 3 && (10..=12).contains(&version.1)
+}
+
+fn hide_command_window(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+fn command_from_python_spec(spec: &str) -> Command {
+    let mut parts = spec.split_whitespace();
+    let executable = parts.next().unwrap_or("python");
+    let mut command = Command::new(executable);
+    for arg in parts {
+        command.arg(arg);
+    }
+    hide_command_window(&mut command);
+    command
+}
+
+fn python_version(spec: &str) -> Option<(u32, u32, u32)> {
+    let mut command = command_from_python_spec(spec);
+    let output = command.arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_python_version(&combined)
+}
+
+fn find_python() -> Option<String> {
+    let candidates = if cfg!(target_os = "windows") {
+        vec![
+            "py -3.11", "py -3.12", "py -3.10", "python", "python3", "py -3",
+        ]
+    } else {
+        vec![
+            "python3.11",
+            "python3.12",
+            "python3.10",
+            "python3",
+            "python",
+        ]
+    };
+
+    // With uv installed the worker builds its venv on a uv-managed Python 3.11,
+    // so the interpreter that bootstraps it may be any Python 3.10+ (e.g. the
+    // system Python 3.14 on Arch).
+    let uv = uv_on_path();
+    for candidate in candidates {
+        if python_version(candidate).is_some_and(|version| {
+            supported_python_version(version) || (uv && version.0 == 3 && version.1 >= 10)
+        }) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn uv_on_path() -> bool {
+    let mut command = Command::new("uv");
+    hide_command_window(&mut command);
+    command
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1603,7 +1932,107 @@ fn make_content_aware_seamless(
     Ok(generated)
 }
 
-fn process_one(path: &Path, options: &SeamlessOptions) -> Result<ProcessedOutput, String> {
+fn make_inference_seamless(
+    app: &AppHandle,
+    source: &RgbaImage,
+    mode: &str,
+    options: &SeamlessOptions,
+) -> Result<RgbaImage, String> {
+    let python = find_python()
+        .ok_or_else(|| "Python 3.10, 3.11, or 3.12 was not found on PATH.".to_string())?;
+    let worker = inference_worker_path(app)?;
+    let app_data = app_data_dir(app)?;
+    let temp_dir = temp_job_dir()?;
+    let jobs_dir = app_data.join("jobs");
+    fs::create_dir_all(&jobs_dir).map_err(|error| format!("Unable to create jobs dir: {error}"))?;
+
+    let input_path = temp_dir.join("inference-input.png");
+    let output_path = temp_dir.join("inference-output.png");
+    source
+        .save(&input_path)
+        .map_err(|error| format!("Unable to write inference input: {error}"))?;
+
+    let mut worker_options = options.clone();
+    worker_options.mode = mode.to_string();
+    worker_options.output_format = "png".to_string();
+    let job = InferenceWorkerJob {
+        input_path: input_path.display().to_string(),
+        output_path: output_path.display().to_string(),
+        env_dir: resolve_env_dir(app)?.display().to_string(),
+        model_dir: resolve_models_root(app)?
+            .join("seamless-inference")
+            .display()
+            .to_string(),
+        options: worker_options,
+    };
+    let job_path = jobs_dir.join(format!("inference-{}.json", next_job_id()));
+    fs::write(
+        &job_path,
+        serde_json::to_string_pretty(&job)
+            .map_err(|error| format!("Unable to serialize inference job: {error}"))?,
+    )
+    .map_err(|error| format!("Unable to write inference job: {error}"))?;
+
+    let mut command = command_from_python_spec(&python);
+    apply_store_env(app, &mut command);
+    command
+        .arg(worker)
+        .arg("--job")
+        .arg(&job_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command
+        .output()
+        .map_err(|error| format!("Unable to start inference worker: {error}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            let event_type = value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !matches!(
+                event_type,
+                "done" | "image_done" | "image_start" | "image_error"
+            ) {
+                let _ = app.emit("seamless-worker-event", value);
+            }
+        }
+    }
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stdout
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_else(|| stderr.trim());
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_file(&job_path);
+        return Err(format!("Inference repair failed: {detail}"));
+    }
+
+    let mut generated = image::open(&output_path)
+        .map_err(|error| format!("Unable to read inference output: {error}"))?
+        .to_rgba8();
+    let edge_polish = options.blend_percent.min(8.0);
+    if matches!(mode, "horizontal" | "tile") {
+        reconcile_horizontal_edges(&mut generated, edge_polish);
+    }
+    if matches!(mode, "vertical" | "tile") {
+        reconcile_vertical_edges(&mut generated, edge_polish);
+    }
+    let _ = fs::remove_dir_all(&temp_dir);
+    let _ = fs::remove_file(&job_path);
+    Ok(generated)
+}
+
+fn process_one_with_app(
+    path: &Path,
+    options: &SeamlessOptions,
+    app: Option<&AppHandle>,
+) -> Result<ProcessedOutput, String> {
     if !path.is_file() {
         return Err("Input path is not a file.".to_string());
     }
@@ -1631,6 +2060,13 @@ fn process_one(path: &Path, options: &SeamlessOptions) -> Result<ProcessedOutput
         "synthesis" => make_content_aware_seamless(&prepared, mode, options.blend_percent)
             .unwrap_or_else(|_| make_seam_cut_seamless(&prepared, mode, options.blend_percent)),
         "blend" => make_seamless(&prepared, mode, options.blend_percent),
+        "inference" => {
+            let app = app.ok_or_else(|| {
+                "Inference strategy requires the desktop app runtime for shared model storage."
+                    .to_string()
+            })?;
+            make_inference_seamless(app, &prepared, mode, options)?
+        }
         _ => unreachable!("strategy normalized before dispatch"),
     };
     let output_path = output_path_for(path, options)?;
@@ -1641,6 +2077,10 @@ fn process_one(path: &Path, options: &SeamlessOptions) -> Result<ProcessedOutput
         output_path,
         message: snap_status_message(snap_info),
     })
+}
+
+fn process_one(path: &Path, options: &SeamlessOptions) -> Result<ProcessedOutput, String> {
+    process_one_with_app(path, options, None)
 }
 
 fn process_paths(
@@ -1660,7 +2100,7 @@ fn process_paths(
             serde_json::json!({ "type": "image_start", "path": path }),
         );
         let input_path = PathBuf::from(&path);
-        match process_one(&input_path, &options) {
+        match process_one_with_app(&input_path, &options, Some(&app)) {
             Ok(processed) => {
                 let output = processed.output_path.display().to_string();
                 let message = processed.message;
@@ -1763,9 +2203,11 @@ async fn start_seamless_job(
     active_jobs.start(job_id.clone())?;
     let active_jobs = active_jobs.inner().clone();
 
-    tauri::async_runtime::spawn_blocking(move || process_paths(app, active_jobs, job_id, paths, options))
-        .await
-        .map_err(|error| format!("Seamless worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        process_paths(app, active_jobs, job_id, paths, options)
+    })
+    .await
+    .map_err(|error| format!("Seamless worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -2033,7 +2475,9 @@ fn parse_agent_job_request(body: &[u8]) -> Result<AgentJobRequest, String> {
     serde_json::from_slice(body).map_err(|error| format!("Invalid JSON request: {error}"))
 }
 
-fn agent_options_from_request(options: Option<serde_json::Value>) -> Result<SeamlessOptions, String> {
+fn agent_options_from_request(
+    options: Option<serde_json::Value>,
+) -> Result<SeamlessOptions, String> {
     let mut merged = serde_json::to_value(default_seamless_options())
         .map_err(|error| format!("Unable to build default options: {error}"))?;
     let Some(options) = options else {
@@ -2069,11 +2513,11 @@ fn handle_agent_route(
             "version": env!("CARGO_PKG_VERSION"),
             "url": agent_status_from(agent_state, active_jobs)?.url
         })),
-        ("GET", "/openapi.json") => Ok(agent_openapi(agent_status_from(agent_state, active_jobs)?.port)),
-        ("GET", "/status") => {
-            serde_json::to_value(agent_status_from(agent_state, active_jobs)?)
-                .map_err(|error| error.to_string())
-        }
+        ("GET", "/openapi.json") => Ok(agent_openapi(
+            agent_status_from(agent_state, active_jobs)?.port,
+        )),
+        ("GET", "/status") => serde_json::to_value(agent_status_from(agent_state, active_jobs)?)
+            .map_err(|error| error.to_string()),
         ("POST", "/process") | ("POST", "/generate") => {
             let request = parse_agent_job_request(&request.body)?;
             let options = agent_options_from_request(request.options)?;
@@ -2083,7 +2527,13 @@ fn handle_agent_route(
             }
             let job_id = next_job_id();
             active_jobs.start(job_id.clone())?;
-            let results = process_paths(app.clone(), active_jobs.clone(), job_id.clone(), paths, options)?;
+            let results = process_paths(
+                app.clone(),
+                active_jobs.clone(),
+                job_id.clone(),
+                paths,
+                options,
+            )?;
             Ok(serde_json::json!({ "ok": true, "jobId": job_id, "results": results }))
         }
         ("POST", "/cancel") => {
@@ -2203,13 +2653,61 @@ fn set_agent_server_enabled(
     enabled: bool,
     port: Option<u16>,
 ) -> Result<AgentServerStatus, String> {
-    set_agent_server_enabled_inner(
-        app,
-        agent_state.inner(),
-        active_jobs.inner(),
-        enabled,
-        port,
-    )
+    set_agent_server_enabled_inner(app, agent_state.inner(), active_jobs.inner(), enabled, port)
+}
+
+fn clamp_window_dimension(value: u32, min: u32, monitor_max: u32) -> u32 {
+    let max = monitor_max.max(1);
+    value.max(min.min(max)).min(max)
+}
+
+fn initial_window_size(monitor_width: u32, monitor_height: u32) -> tauri::PhysicalSize<u32> {
+    let width_ratio = if monitor_width < monitor_height {
+        PORTRAIT_WINDOW_WIDTH_RATIO
+    } else {
+        LANDSCAPE_WINDOW_WIDTH_RATIO
+    };
+    let aspect = DEFAULT_WINDOW_HEIGHT as f64 / DEFAULT_WINDOW_WIDTH as f64;
+    let mut width = (monitor_width as f64 * width_ratio).round();
+    let mut height = (width * aspect).round();
+    let max_height = (monitor_height as f64 * 0.9).round().max(1.0);
+
+    if height > max_height {
+        height = max_height;
+        width = (height / aspect).round();
+    }
+
+    tauri::PhysicalSize::new(width.max(1.0) as u32, height.max(1.0) as u32)
+}
+
+fn apply_initial_window_size(app: &tauri::App) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let monitor_size = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .map(|monitor| *monitor.size());
+    let monitor_width = monitor_size
+        .as_ref()
+        .map(|size| size.width)
+        .unwrap_or(DEFAULT_WINDOW_WIDTH);
+    let monitor_height = monitor_size
+        .as_ref()
+        .map(|size| size.height)
+        .unwrap_or(DEFAULT_WINDOW_HEIGHT);
+    let size = initial_window_size(monitor_width, monitor_height);
+    let size = tauri::PhysicalSize::new(
+        clamp_window_dimension(size.width, MIN_WINDOW_WIDTH, monitor_width),
+        clamp_window_dimension(size.height, MIN_WINDOW_HEIGHT, monitor_height),
+    );
+
+    if let Err(error) = window.set_size(tauri::Size::Physical(size)) {
+        eprintln!("Failed to initialize window size: {error}");
+    }
+    let _ = window.center();
 }
 
 pub fn run() {
@@ -2255,6 +2753,9 @@ fn run_app(headless_agent_port: Option<u16>) {
                 )?;
                 println!("Agent API listening on {}", status.url);
             }
+            // Tauri keeps only the last `.setup()` hook, so everything that
+            // runs at startup must live in this one.
+            apply_initial_window_size(app);
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
@@ -2658,7 +3159,11 @@ mod tests {
 
         let cropped = snap_periodic_crop(&source, "tile");
         assert_eq!(cropped.width() % 25, 0);
-        assert_eq!(cropped.height() % 32, 0, "height should snap to course pair");
+        assert_eq!(
+            cropped.height() % 32,
+            0,
+            "height should snap to course pair"
+        );
         // The cropped image must already wrap perfectly before any seam work.
         for y in 0..cropped.height() {
             assert_eq!(
@@ -2717,13 +3222,18 @@ mod tests {
             strategy: "seam-cut".to_string(),
             flatten: 0.0,
             snap_period: true,
+            inference_model: default_inference_model(),
+            inference_prompt: default_inference_prompt(),
+            inference_negative_prompt: default_inference_negative_prompt(),
+            inference_denoise: default_inference_denoise(),
+            inference_guidance: default_inference_guidance(),
+            inference_steps: default_inference_steps(),
+            inference_seed: 0,
         };
 
         let output = process_one(&input, &options).expect("process snapped image");
         assert!(
-            output
-                .message
-                .contains("snapped 132x100 to 125x96"),
+            output.message.contains("snapped 132x100 to 125x96"),
             "unexpected message: {}",
             output.message
         );
