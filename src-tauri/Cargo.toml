@@ -1,6 +1,6 @@
 [package]
 name = "seamless-image-edit"
-version = "26.11.7"
+version = "26.11.8"
 description = "Local seamless texture and tile image editor"
 authors = ["Neko Legends"]
 license = "MIT"
